@@ -1,0 +1,28 @@
+name: Build VOXN 2 Cyber Gold VST3 & Standalone
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake with MSVC
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile VST3 and Standalone
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Upload VOXN 2 VST3 & Standalone Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VOXN2-CyberGold-Windows-VST3
+          path: |
+            build/VOXN2_CyberGold_artefacts/Release/VST3/**
+            build/VOXN2_CyberGold_artefacts/Release/Standalone/**
