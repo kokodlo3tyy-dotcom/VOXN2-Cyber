@@ -13,16 +13,63 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake with MSVC
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Clone JUCE Framework (v8.0.4)
+        run: |
+          git clone --depth 1 --branch 8.0.4 https://github.com/juce-framework/JUCE.git JUCE
 
-      - name: Compile VST3 and Standalone
-        run: cmake --build build --config Release --parallel 4
+      - name: Generate Official Logo Icon #2 (VG Cyber Gold Monogram PNG)
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          New-Item -ItemType Directory -Force -Path "Assets" | Out-Null
+          $bmp = New-Object System.Drawing.Bitmap(256, 256)
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+          $g.Clear([System.Drawing.Color]::FromArgb(255, 20, 20, 24))
 
-      - name: Upload VOXN 2 VST3 & Standalone Artifact
+          $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 229, 184, 75), 10)
+          $g.DrawRectangle($borderPen, 12, 12, 232, 232)
+
+          $logoPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 229, 184, 75), 18)
+          $logoPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+          $logoPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+          $logoPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Miter
+
+          $pts = @(
+            [System.Drawing.Point]::new(34, 56),
+            [System.Drawing.Point]::new(86, 202),
+            [System.Drawing.Point]::new(124, 96),
+            [System.Drawing.Point]::new(144, 158),
+            [System.Drawing.Point]::new(168, 66),
+            [System.Drawing.Point]::new(224, 66)
+          )
+          $g.DrawLines($logoPen, $pts)
+
+          $gPts = @(
+            [System.Drawing.Point]::new(168, 66),
+            [System.Drawing.Point]::new(152, 196),
+            [System.Drawing.Point]::new(222, 196),
+            [System.Drawing.Point]::new(222, 134),
+            [System.Drawing.Point]::new(186, 134)
+          )
+          $g.DrawLines($logoPen, $gPts)
+
+          $bmp.Save("Assets/VoxN2Icon.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $g.Dispose()
+          $bmp.Dispose()
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build VST3 and Standalone Release
+        run: |
+          cmake --build build --config Release --target VOXN2CyberGold_VST3 VOXN2CyberGold_Standalone
+
+      - name: Upload Compiled Plugins
         uses: actions/upload-artifact@v4
         with:
-          name: VOXN2-CyberGold-Windows-VST3
+          name: VOXN2-CyberGold-Windows-x64
           path: |
-            build/VOXN2_CyberGold_artefacts/Release/VST3/**
-            build/VOXN2_CyberGold_artefacts/Release/Standalone/**
+            build/VOXN2CyberGold_artefacts/Release/VST3/VOXN 2 Cyber Gold.vst3
+            build/VOXN2CyberGold_artefacts/Release/Standalone/VOXN 2 Cyber Gold.exe
