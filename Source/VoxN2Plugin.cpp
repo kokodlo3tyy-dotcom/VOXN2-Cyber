@@ -1,5 +1,6 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_utils/juce_audio_utils.h>
+#include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_gui_extra/juce_gui_extra.h>
@@ -10,6 +11,13 @@
 #include <array>
 #include <vector>
 
+enum EngineExclusiveMode
+{
+    ModeMelodyOnly   = 0,
+    ModeTriggersOnly = 1,
+    ModeChordsOnly   = 2
+};
+
 struct MaqamPreset
 {
     const char* nameEn;
@@ -17,7 +25,10 @@ struct MaqamPreset
     std::array<int, 12> intervals; // 0 = Off, 1 = Natural, 2 = Quarter-Tone Flat (1/2b)
 };
 
-static const std::array<MaqamPreset, 8> kMaqamat = {{
+// 10 سلالم ومقامات تشمل الميجور والماينور والمقامات الشرقية
+static const std::array<MaqamPreset, 10> kMaqamat = {{
+    { "Major",    "ميجور",  {1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1} },
+    { "Minor",    "ماينور", {1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0} },
     { "Rast",     "راست",   {1, 0, 1, 0, 2, 1, 0, 1, 0, 1, 0, 2} },
     { "Bayati",   "بياتي",  {1, 0, 2, 1, 0, 1, 0, 1, 0, 1, 1, 0} },
     { "Sikah",    "سيكاه",  {2, 0, 1, 0, 1, 1, 0, 2, 0, 1, 0, 1} },
@@ -33,7 +44,6 @@ static const char* kNoteNames[12] = { "C","C#","D","D#","E","F","F#","G","G#","A
 struct TriggerPadData
 {
     juce::String name;
-    juce::String subLabel;
     int midiNote = 36;
     bool muted = false;
     bool hasCustomSample = false;
@@ -41,10 +51,19 @@ struct TriggerPadData
     juce::AudioBuffer<float> sampleBuffer;
     double sampleRate = 44100.0;
     int playhead = -1;
-    int trainedTakes = 12;
     float flashAlpha = 0.0f;
+
+    // بصمة الصوت لتدريب البيت بوكس (Beatbox Voice Fingerprint)
+    bool isVoiceTrained = false;
+    int trainedHits = 0;
+    float featZCR = 0.0f;       // معدل تقاطع الصفر (يميز الدم عن التك والهاي هات)
+    float featHighRatio = 0.0f; // نسبة الترددات العالية للمنخفضة
+    float featSustain = 0.0f;   // طول النفس/الطنين (يميز البيز Bzzz عن الضربات الخاطفة)
 };
 
+// ==============================================================================
+// المعالج الصوتي الرئيسي (VoxN2AudioProcessor)
+// ==============================================================================
 class VoxN2AudioProcessor : public juce::AudioProcessor
 {
 public:
@@ -55,27 +74,18 @@ public:
     {
         formatManager.registerBasicFormats();
 
-        const char* defaultNames[8] = {
-            "Dum Baladi", "Acoustic Snare", "Closed Hi-Hat",
-            "Hand Clap", "Tak Darbuka", "Sak Shaabi",
-            "Riq Shimmies", "Sub Kick 808"
-        };
-        const char* defaultSubs[8] = {
-            "Kick / C1", "Snare / D1", "Hat / F#1",
-            "Clap / D#1", "Tak / G#1", "Sak / E1",
-            "Riq / A#1", "Sub / B0"
-        };
+        // مربعات فارغة تماماً مثل FPC بدون أي أصوات مدمجة
         const int defaultNotes[8] = { 36, 38, 42, 39, 44, 40, 46, 35 };
-
         for (int i = 0; i < 8; ++i)
         {
-            pads[i].name = defaultNames[i];
-            pads[i].subLabel = defaultSubs[i];
+            pads[i].name = "Pad " + juce::String (i + 1);
             pads[i].midiNote = defaultNotes[i];
-            generateBuiltInPercussion (i);
+            pads[i].hasCustomSample = false;
+            pads[i].isVoiceTrained = false;
         }
 
-        applyMaqamPreset (0, 0);
+        applyMaqamPreset (0, 2); // Default: C Rast
+        autoConnectDirectMidiDevice();
     }
 
     ~VoxN2AudioProcessor() override = default;
@@ -86,6 +96,7 @@ public:
         yinBuffer.assign (kYinWindowSize, 0.0f);
         yinWritePos = 0;
         synthPhase = 0.0;
+        lpFilterState = 0.0f;
     }
 
     void releaseResources() override {}
@@ -95,16 +106,191 @@ public:
         return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
     }
 
+    void autoConnectDirectMidiDevice()
+    {
+        auto devices = juce::MidiOutput::getAvailableDevices();
+        for (int i = 0; i < devices.size(); ++i)
+        {
+            juce::String dName = devices[i].name;
+            if ((dName.containsIgnoreCase ("loop") || dName.containsIgnoreCase ("voxn") || dName.containsIgnoreCase ("midi"))
+                && ! dName.containsIgnoreCase ("Microsoft GS"))
+            {
+                openDirectMidiDeviceByIndex (i);
+                return;
+            }
+        }
+    }
+
+    void cycleDirectMidiDevice()
+    {
+        auto devices = juce::MidiOutput::getAvailableDevices();
+        if (devices.isEmpty())
+        {
+            const juce::SpinLock::ScopedLockType sl (directMidiLock);
+            directMidiOut.reset();
+            directMidiDeviceName = "No loopMIDI Found";
+            return;
+        }
+
+        directMidiDeviceIndex = (directMidiDeviceIndex + 1) % (devices.size() + 1);
+        if (directMidiDeviceIndex == devices.size())
+        {
+            const juce::SpinLock::ScopedLockType sl (directMidiLock);
+            directMidiOut.reset();
+            directMidiDeviceName = "Direct MIDI: OFF";
+        }
+        else
+        {
+            openDirectMidiDeviceByIndex (directMidiDeviceIndex);
+        }
+    }
+
+    void openDirectMidiDeviceByIndex (int idx)
+    {
+        auto devices = juce::MidiOutput::getAvailableDevices();
+        if (idx >= 0 && idx < devices.size())
+        {
+            auto opened = juce::MidiOutput::openDevice (devices[idx].identifier);
+            const juce::SpinLock::ScopedLockType sl (directMidiLock);
+            if (opened != nullptr)
+            {
+                directMidiOut = std::move (opened);
+                directMidiDeviceName = devices[idx].name;
+                directMidiDeviceIndex = idx;
+            }
+        }
+    }
+
+    void emitMidiEvent (const juce::MidiMessage& msg, juce::MidiBuffer& midiMessages, int sampleOffset = 0)
+    {
+        midiMessages.addEvent (msg, sampleOffset);
+        {
+            const juce::SpinLock::ScopedLockType sl (directMidiLock);
+            if (directMidiOut != nullptr)
+                directMidiOut->sendMessageNow (msg);
+        }
+        recordMidiEventInternal (msg);
+    }
+
+    void setExclusiveEngineMode (int newMode)
+    {
+        int clamped = juce::jlimit (0, 2, newMode);
+        if (exclusiveMode.exchange (clamped) != clamped)
+            pendingAllNotesOff.store (true);
+    }
+
+    // ==========================================================================
+    // بدء أو مسح تدريب الصوت للبيت بوكس على الـ Pad المختار
+    // ==========================================================================
+    void startVoiceTrainingForPad (int padIndex)
+    {
+        if (padIndex < 0 || padIndex >= 8) return;
+        setExclusiveEngineMode (ModeTriggersOnly);
+        pads[padIndex].isVoiceTrained = false;
+        pads[padIndex].trainedHits = 0;
+        pads[padIndex].featZCR = 0.0f;
+        pads[padIndex].featHighRatio = 0.0f;
+        pads[padIndex].featSustain = 0.0f;
+        trainingPadIndex.store (padIndex);
+    }
+
+    void clearVoiceTrainingForPad (int padIndex)
+    {
+        if (padIndex < 0 || padIndex >= 8) return;
+        if (trainingPadIndex.load() == padIndex)
+            trainingPadIndex.store (-1);
+        pads[padIndex].isVoiceTrained = false;
+        pads[padIndex].trainedHits = 0;
+    }
+
+    // ==========================================================================
+    // تسجيل وسحب الـ MIDI المباشر (MIDI Capture)
+    // ==========================================================================
+    void startMidiCapture()
+    {
+        const juce::SpinLock::ScopedLockType sl (captureLock);
+        capturedMidiSequence.clear();
+        capturedSamplesElapsed = 0;
+        captureFirstEventReceived = false;
+        capturedNoteCount.store (0);
+        isCapturingMidi.store (true);
+    }
+
+    void stopMidiCapture()
+    {
+        isCapturingMidi.store (false);
+        const juce::SpinLock::ScopedLockType sl (captureLock);
+        double endTicks = ((double) capturedSamplesElapsed / currentSampleRate) * 1920.0;
+        for (int ch = 1; ch <= 16; ++ch)
+            for (int n = 0; n < 128; ++n)
+                capturedMidiSequence.addEvent (juce::MidiMessage::noteOff (ch, n), endTicks);
+        capturedMidiSequence.updateMatchedPairs();
+    }
+
+    void clearMidiCapture()
+    {
+        isCapturingMidi.store (false);
+        const juce::SpinLock::ScopedLockType sl (captureLock);
+        capturedMidiSequence.clear();
+        capturedSamplesElapsed = 0;
+        captureFirstEventReceived = false;
+        capturedNoteCount.store (0);
+    }
+
+    void recordMidiEventInternal (const juce::MidiMessage& msg)
+    {
+        if (! isCapturingMidi.load()) return;
+        const juce::SpinLock::ScopedLockType sl (captureLock);
+        if (! captureFirstEventReceived)
+        {
+            captureFirstEventReceived = true;
+            capturedSamplesElapsed = 0;
+        }
+        double ticks = ((double) capturedSamplesElapsed / currentSampleRate) * 1920.0;
+        juce::MidiMessage copy (msg);
+        copy.setTimeStamp (ticks);
+        capturedMidiSequence.addEvent (copy);
+        capturedMidiSequence.updateMatchedPairs();
+        if (msg.isNoteOn())
+            capturedNoteCount.fetch_add (1);
+    }
+
+    juce::File exportCapturedMidiToFile (const juce::File& targetFile)
+    {
+        juce::MidiMessageSequence seqCopy;
+        {
+            const juce::SpinLock::ScopedLockType sl (captureLock);
+            seqCopy = capturedMidiSequence;
+        }
+        if (seqCopy.getNumEvents() == 0)
+        {
+            seqCopy.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0.0);
+            seqCopy.addEvent (juce::MidiMessage::noteOff (1, 60), 960.0);
+        }
+        seqCopy.updateMatchedPairs();
+        juce::MidiFile midiFile;
+        midiFile.setTicksPerQuarterNote (960);
+        midiFile.addTrack (seqCopy);
+        targetFile.deleteFile();
+        juce::FileOutputStream out (targetFile);
+        if (out.openedOk()) { midiFile.writeTo (out); out.flush(); }
+        return targetFile;
+    }
+
+    juce::File exportCapturedMidiToTempFile()
+    {
+        return exportCapturedMidiToFile (juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                             .getChildFile ("VOXN2_CyberGold_Captured.mid"));
+    }
+
+    // تحميل أو مسح عينة WAV/MP3 على الـ Pad (نظام FPC)
     bool loadCustomSampleForPad (int padIndex, const juce::File& file)
     {
-        if (padIndex < 0 || padIndex >= 8 || ! file.existsAsFile())
-            return false;
-
+        if (padIndex < 0 || padIndex >= 8 || ! file.existsAsFile()) return false;
         std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
-        if (reader == nullptr)
-            return false;
+        if (reader == nullptr) return false;
 
-        const int numSamples = (int) juce::jmin<juce::int64> (reader->lengthInSamples, (juce::int64) (reader->sampleRate * 5.0));
+        const int numSamples = (int) juce::jmin<juce::int64> (reader->lengthInSamples, (juce::int64) (reader->sampleRate * 8.0));
         juce::AudioBuffer<float> tempBuffer (1, numSamples);
         reader->read (&tempBuffer, 0, numSamples, 0, true, false);
 
@@ -117,26 +303,26 @@ public:
         return true;
     }
 
-    void revertPadToBuiltIn (int padIndex)
+    void clearPadSample (int padIndex)
     {
         if (padIndex < 0 || padIndex >= 8) return;
         const juce::ScopedLock sl (sampleLock);
         pads[padIndex].hasCustomSample = false;
         pads[padIndex].customFileName.clear();
-        generateBuiltInPercussion (padIndex);
+        pads[padIndex].sampleBuffer.setSize (0, 0);
+        pads[padIndex].playhead = -1;
     }
 
     void triggerPadNow (int padIndex)
     {
-        if (padIndex < 0 || padIndex >= 8) return;
-        pendingPadTrigger.store (padIndex);
+        if (padIndex >= 0 && padIndex < 8)
+            pendingPadTrigger.store (padIndex);
     }
 
     void applyMaqamPreset (int root, int maqamIdx)
     {
         rootNote = juce::jlimit (0, 11, root);
         currentMaqamIndex = juce::jlimit (0, (int) kMaqamat.size() - 1, maqamIdx);
-
         for (int i = 0; i < 12; ++i)
         {
             int interval = (i - rootNote + 12) % 12;
@@ -147,20 +333,13 @@ public:
     float detectPitchYIN (const std::vector<float>& buf, double sr)
     {
         const int W = (int) buf.size() / 2;
-        std::vector<float> diff (W, 0.0f);
-        std::vector<float> cmnd (W, 0.0f);
-
+        std::vector<float> diff (W, 0.0f), cmnd (W, 0.0f);
         for (int tau = 1; tau < W; ++tau)
         {
             float sum = 0.0f;
-            for (int i = 0; i < W; ++i)
-            {
-                float d = buf[i] - buf[i + tau];
-                sum += d * d;
-            }
+            for (int i = 0; i < W; ++i) { float d = buf[i] - buf[i + tau]; sum += d * d; }
             diff[tau] = sum;
         }
-
         cmnd[0] = 1.0f;
         float runningSum = 0.0f;
         for (int tau = 1; tau < W; ++tau)
@@ -168,42 +347,38 @@ public:
             runningSum += diff[tau];
             cmnd[tau] = (runningSum > 1.0e-9f) ? (diff[tau] * (float) tau / runningSum) : 1.0f;
         }
-
         const int minTau = juce::jmax (2, (int) (sr / 1000.0));
         const int maxTau = juce::jmin (W - 2, (int) (sr / 65.0));
-        const float threshold = 0.14f;
-
         int bestTau = -1;
         for (int tau = minTau; tau < maxTau; ++tau)
         {
-            if (cmnd[tau] < threshold)
+            if (cmnd[tau] < 0.14f)
             {
-                while (tau + 1 < maxTau && cmnd[tau + 1] < cmnd[tau])
-                    ++tau;
+                while (tau + 1 < maxTau && cmnd[tau + 1] < cmnd[tau]) ++tau;
                 bestTau = tau;
                 break;
             }
         }
-
-        if (bestTau < 0)
-            return -1.0f;
-
-        float s0 = cmnd[bestTau - 1];
-        float s1 = cmnd[bestTau];
-        float s2 = cmnd[bestTau + 1];
+        if (bestTau < 0) return -1.0f;
+        float s0 = cmnd[bestTau - 1], s1 = cmnd[bestTau], s2 = cmnd[bestTau + 1];
         float denom = 2.0f * (2.0f * s1 - s2 - s0);
         float betterTau = (float) bestTau + ((std::abs (denom) > 1e-6f) ? (s2 - s0) / denom : 0.0f);
-
         return (betterTau > 0.0f) ? (float) (sr / betterTau) : -1.0f;
     }
 
+    // ==========================================================================
+    // معالجة الصوت وتحويل الأوكتاف وتدريب البيت بوكس (processBlock)
+    // ==========================================================================
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override
     {
         juce::ScopedNoDenormals noDenormals;
-
         const int numSamples = buffer.getNumSamples();
         const int numInChannels = getTotalNumInputChannels();
         const int numOutChannels = getTotalNumOutputChannels();
+
+        midiMessages.clear();
+        if (isCapturingMidi.load() && captureFirstEventReceived)
+            capturedSamplesElapsed += numSamples;
 
         std::vector<float> micMono (numSamples, 0.0f);
         if (numInChannels > 0)
@@ -215,12 +390,24 @@ public:
         for (int ch = 0; ch < numOutChannels; ++ch)
             buffer.clear (ch, 0, numSamples);
 
-        float sumSq = 0.0f;
+        if (pendingAllNotesOff.exchange (false))
+            stopActiveMelodyAndChords (midiMessages);
+
+        // استخراج الخصائص الصوتية (RMS + ZCR + High/Low Energy + Peak) لتدريب البيت بوكس
+        float sumSq = 0.0f, highEnergy = 0.0f, lowEnergy = 0.0f, peakAbs = 0.0f;
         int zeroCrossings = 0;
         for (int i = 0; i < numSamples; ++i)
         {
             float s = micMono[i];
             sumSq += s * s;
+            peakAbs = juce::jmax (peakAbs, std::abs (s));
+
+            // فلتر بسيط لفصل التردد المنخفض (دم/بيز) عن المرتفع (تك/سناير/هاي هات)
+            lpFilterState = 0.88f * lpFilterState + 0.12f * s;
+            float hp = s - lpFilterState;
+            lowEnergy  += lpFilterState * lpFilterState;
+            highEnergy += hp * hp;
+
             if (i > 0 && ((micMono[i - 1] >= 0.0f && s < 0.0f) || (micMono[i - 1] < 0.0f && s >= 0.0f)))
                 ++zeroCrossings;
 
@@ -231,140 +418,195 @@ public:
         float rms = std::sqrt (sumSq / (float) juce::jmax (1, numSamples));
         currentInputRms.store (rms);
         float zcr = (float) zeroCrossings / (float) juce::jmax (1, numSamples);
+        float highRatio = highEnergy / (lowEnergy + highEnergy + 1.0e-6f);
+        float sustainRatio = (peakAbs > 1.0e-5f) ? (rms / peakAbs) : 0.0f;
 
-        float envTarget = juce::jlimit (0.0f, 1.0f, rms * 8.5f);
-        vowelEnv = 0.85f * vowelEnv + 0.15f * envTarget;
-        if (rms > gateThreshold)
-        {
-            vowelEEE = juce::jlimit (0.0f, 1.0f, zcr * 3.5f);
-            vowelOOO = juce::jlimit (0.0f, 1.0f, 1.0f - zcr * 2.8f);
-            vowelAAA = juce::jlimit (0.0f, 1.0f, 1.0f - std::abs (zcr - 0.15f) * 4.0f);
+        vowelEnv = 0.85f * vowelEnv + 0.15f * juce::jlimit (0.0f, 1.0f, rms * 8.5f);
 
-            midiMessages.addEvent (juce::MidiMessage::controllerEvent (pitchMidiChannel, ccNumberAAA, (int) (vowelAAA * 127.0f)), 0);
-            midiMessages.addEvent (juce::MidiMessage::controllerEvent (pitchMidiChannel, ccNumberEEE, (int) (vowelEEE * 127.0f)), 0);
-            midiMessages.addEvent (juce::MidiMessage::controllerEvent (pitchMidiChannel, ccNumberOOO, (int) (vowelOOO * 127.0f)), 0);
-            midiMessages.addEvent (juce::MidiMessage::controllerEvent (pitchMidiChannel, ccNumberENV, (int) (vowelEnv * 127.0f)), 0);
-        }
-
+        const int mode = exclusiveMode.load();
         int manualPad = pendingPadTrigger.exchange (-1);
         if (manualPad >= 0 && manualPad < 8)
             fireTriggerPad (manualPad, midiMessages);
 
-        if (triggerCooldownSamples > 0)
-            triggerCooldownSamples -= numSamples;
-
-        float onsetDelta = rms - prevRms;
-        prevRms = rms;
-        float onsetThresh = 0.18f - (triggerSensitivity * 0.14f);
-
-        if (onsetDelta > onsetThresh && triggerCooldownSamples <= 0)
+        // ======================================================================
+        // وضع الكيك والسنير والبيت بوكس المعزول (ModeTriggersOnly)
+        // ======================================================================
+        if (mode == ModeTriggersOnly)
         {
-            int detectedPad = (zcr < 0.09f) ? 0 : ((zcr < 0.20f) ? 1 : 2);
-            fireTriggerPad (detectedPad, midiMessages);
-            triggerCooldownSamples = (int) (currentSampleRate * 0.11);
-        }
+            if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty())
+                stopActiveMelodyAndChords (midiMessages);
 
-        int manualNote = guiManualMidiNote.load();
-        float detectedFreq = -1.0f;
+            if (triggerCooldownSamples > 0)
+                triggerCooldownSamples -= numSamples;
 
-        if (manualNote >= 0)
-        {
-            detectedFreq = 440.0f * std::pow (2.0f, (manualNote - 69.0f) / 12.0f);
-        }
-        else if (rms > gateThreshold)
-        {
-            std::vector<float> orderedYin (kYinWindowSize);
-            for (int i = 0; i < kYinWindowSize; ++i)
-                orderedYin[i] = yinBuffer[(yinWritePos + i) % kYinWindowSize];
+            float onsetDelta = rms - prevRms;
+            prevRms = rms;
+            float onsetThresh = 0.16f - (triggerSensitivity * 0.125f);
 
-            detectedFreq = detectPitchYIN (orderedYin, currentSampleRate);
-        }
-
-        if (detectedFreq > 60.0f && detectedFreq < 1050.0f)
-        {
-            float rawMidi = 69.0f + 12.0f * std::log2 (detectedFreq / 440.0f);
-            rawMidi += (float) (octaveShift * 12);
-
-            int candidateMidi = (int) std::round (rawMidi);
-            float hysteresisWidth = 0.48f + (stickiness * 0.45f);
-
-            if (activeRawMidiNote >= 0 && std::abs (rawMidi - (float) activeRawMidiNote) < hysteresisWidth)
+            if (onsetDelta > onsetThresh && triggerCooldownSamples <= 0 && rms > 0.02f)
             {
-                candidateMidi = activeRawMidiNote;
-                confirmCounter = noteHoldFrames;
-            }
-            else if (candidateMidi != pendingCandidateNote)
-            {
-                pendingCandidateNote = candidateMidi;
-                confirmCounter = 1;
-            }
-            else
-            {
-                confirmCounter++;
-            }
-
-            if (confirmCounter >= noteHoldFrames || activeRawMidiNote < 0)
-            {
-                activeRawMidiNote = candidateMidi;
-                int snappedMidi = snapToMaqamScale (activeRawMidiNote);
-                int pc = ((snappedMidi % 12) + 12) % 12;
-
-                float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
-                if (truBendMode && manualNote < 0)
+                int trainIdx = trainingPadIndex.load();
+                if (trainIdx >= 0 && trainIdx < 8)
                 {
-                    float vocalDeviationCents = (rawMidi - (float) activeRawMidiNote) * 100.0f;
-                    targetCents += vocalDeviationCents * 0.65f;
-                }
+                    // نحن في وضع تدريب الصوت: نلتقط بصمة الصوت (3 مرات) ونحفظها للـ Pad
+                    auto& tp = pads[trainIdx];
+                    float n = (float) tp.trainedHits;
+                    tp.featZCR       = (tp.featZCR * n + zcr) / (n + 1.0f);
+                    tp.featHighRatio = (tp.featHighRatio * n + highRatio) / (n + 1.0f);
+                    tp.featSustain   = (tp.featSustain * n + sustainRatio) / (n + 1.0f);
+                    tp.trainedHits++;
+                    tp.isVoiceTrained = true;
+                    fireTriggerPad (trainIdx, midiMessages);
 
-                float maxBendCents = (float) pbRangeSemitones * 100.0f;
-                int pbValue = 8192 + (int) std::round ((targetCents / maxBendCents) * 8192.0f);
-                pbValue = juce::jlimit (0, 16383, pbValue);
-                currentPitchBendValue.store (pbValue);
-                currentCentsOffset.store ((int) std::round (targetCents));
-
-                if (snappedMidi != activeOutputMidiNote)
-                {
-                    if (activeOutputMidiNote >= 0)
-                    {
-                        midiMessages.addEvent (juce::MidiMessage::noteOff (pitchMidiChannel, activeOutputMidiNote), 0);
-                        stopActiveChord (midiMessages);
-                    }
-
-                    midiMessages.addEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), 0);
-                    juce::uint8 vel = (juce::uint8) juce::jlimit (50, 127, (int) (vowelEnv * 115.0f + 45.0f));
-                    midiMessages.addEvent (juce::MidiMessage::noteOn (pitchMidiChannel, snappedMidi, vel), 0);
-
-                    activeOutputMidiNote = snappedMidi;
-                    currentDetectedMidiNote.store (snappedMidi);
-
-                    if (chordsEnabled)
-                        triggerSmartOrientalChord (snappedMidi, vel, midiMessages);
+                    if (tp.trainedHits >= 3)
+                        trainingPadIndex.store (-1); // اكتمل التدريب (3/3)
                 }
                 else
                 {
-                    midiMessages.addEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), 0);
+                    // البحث عن أقرب Pad مدرب يطابق بصمة صوت المستخدم الحالية
+                    int bestPad = -1;
+                    float bestDist = 999.0f;
+                    for (int p = 0; p < 8; ++p)
+                    {
+                        if (pads[p].isVoiceTrained)
+                        {
+                            float dz = (zcr - pads[p].featZCR) * 3.2f;
+                            float dh = (highRatio - pads[p].featHighRatio) * 2.5f;
+                            float ds = (sustainRatio - pads[p].featSustain) * 1.4f;
+                            float dist = std::sqrt (dz * dz + dh * dh + ds * ds);
+                            if (dist < bestDist)
+                            {
+                                bestDist = dist;
+                                bestPad = p;
+                            }
+                        }
+                    }
+
+                    // إذا لم يدرب المستخدم أي Pad بعد، نستخدم التقسيم الترددي الافتراضي (Pad 0, 1, 2)
+                    if (bestPad < 0)
+                        bestPad = (highRatio < 0.25f) ? 0 : ((zcr < 0.18f) ? 1 : 2);
+
+                    fireTriggerPad (bestPad, midiMessages);
                 }
+
+                triggerCooldownSamples = (int) (currentSampleRate * 0.12);
             }
         }
         else
         {
-            if (activeOutputMidiNote >= 0)
+            prevRms = rms;
+
+            // ==================================================================
+            // وضع الميلودي (0) أو وضع الكوردات (2) مع تحويل الأوكتاف والـ Semitone
+            // ==================================================================
+            if (rms > gateThreshold)
             {
-                midiMessages.addEvent (juce::MidiMessage::noteOff (pitchMidiChannel, activeOutputMidiNote), 0);
-                midiMessages.addEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, 8192), 0);
-                stopActiveChord (midiMessages);
-                activeOutputMidiNote = -1;
-                activeRawMidiNote = -1;
-                currentDetectedMidiNote.store (-1);
-                currentPitchBendValue.store (8192);
-                currentCentsOffset.store (0);
+                vowelEEE = juce::jlimit (0.0f, 1.0f, zcr * 3.5f);
+                vowelOOO = juce::jlimit (0.0f, 1.0f, 1.0f - zcr * 2.8f);
+                vowelAAA = juce::jlimit (0.0f, 1.0f, 1.0f - std::abs (zcr - 0.15f) * 4.0f);
+            }
+
+            int manualNote = guiManualMidiNote.load();
+            float detectedFreq = -1.0f;
+
+            if (manualNote >= 0)
+            {
+                detectedFreq = 440.0f * std::pow (2.0f, (manualNote - 69.0f) / 12.0f);
+            }
+            else if (rms > gateThreshold)
+            {
+                std::vector<float> orderedYin (kYinWindowSize);
+                for (int i = 0; i < kYinWindowSize; ++i)
+                    orderedYin[i] = yinBuffer[(yinWritePos + i) % kYinWindowSize];
+                detectedFreq = detectPitchYIN (orderedYin, currentSampleRate);
+            }
+
+            if (detectedFreq > 60.0f && detectedFreq < 1050.0f)
+            {
+                float rawMidi = 69.0f + 12.0f * std::log2 (detectedFreq / 440.0f);
+
+                // 1) تطبيق النقل بالسيميتون (Semitone Transpose -12 .. +12)
+                rawMidi += (float) semitoneTranspose;
+
+                // 2) تثبيت أوكتاف البداية (Target Start Octave: Oct 1 .. Oct 5) أو اتباع الأوكتاف الطبيعي
+                int candidateMidi = (int) std::round (rawMidi);
+                if (targetStartOctave >= 1 && targetStartOctave <= 5 && manualNote < 0)
+                {
+                    int noteInScale = ((candidateMidi - rootNote) % 12 + 12) % 12;
+                    int baseMidi = (targetStartOctave + 1) * 12 + rootNote; // C1=24, C2=36, C3=48, C4=60, C5=72
+                    candidateMidi = baseMidi + noteInScale;
+                }
+                else
+                {
+                    candidateMidi += octaveShift * 12;
+                }
+
+                candidateMidi = juce::jlimit (12, 115, candidateMidi);
+
+                float hysteresisWidth = 0.48f + (stickiness * 0.45f);
+                if (activeRawMidiNote >= 0 && std::abs ((float) candidateMidi - (float) activeRawMidiNote) < hysteresisWidth)
+                {
+                    candidateMidi = activeRawMidiNote;
+                    confirmCounter = noteHoldFrames;
+                }
+                else if (candidateMidi != pendingCandidateNote)
+                {
+                    pendingCandidateNote = candidateMidi;
+                    confirmCounter = 1;
+                }
+                else
+                {
+                    confirmCounter++;
+                }
+
+                if (confirmCounter >= noteHoldFrames || activeRawMidiNote < 0)
+                {
+                    activeRawMidiNote = candidateMidi;
+                    int snappedMidi = snapToMaqamScale (activeRawMidiNote);
+                    int pc = ((snappedMidi % 12) + 12) % 12;
+
+                    float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
+                    float maxBendCents = (float) pbRangeSemitones * 100.0f;
+                    int pbValue = 8192 + (int) std::round ((targetCents / maxBendCents) * 8192.0f);
+                    pbValue = juce::jlimit (0, 16383, pbValue);
+                    currentPitchBendValue.store (pbValue);
+                    currentCentsOffset.store ((int) std::round (targetCents));
+
+                    if (snappedMidi != activeOutputMidiNote)
+                    {
+                        stopActiveMelodyAndChords (midiMessages);
+                        juce::uint8 vel = (juce::uint8) juce::jlimit (65, 127, (int) (vowelEnv * 115.0f + 50.0f));
+                        activeOutputMidiNote = snappedMidi;
+                        currentDetectedMidiNote.store (snappedMidi);
+
+                        if (mode == ModeMelodyOnly)
+                        {
+                            emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, 0);
+                            emitMidiEvent (juce::MidiMessage::noteOn (pitchMidiChannel, snappedMidi, vel), midiMessages, 0);
+                        }
+                        else if (mode == ModeChordsOnly)
+                        {
+                            triggerSmartOrientalChord (snappedMidi, vel, midiMessages);
+                        }
+                    }
+                    else if (mode == ModeMelodyOnly)
+                    {
+                        emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, 0);
+                    }
+                }
+            }
+            else
+            {
+                if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty())
+                    stopActiveMelodyAndChords (midiMessages);
             }
         }
 
+        // مخرج الصوت الداخلي (يشغل فقط الخامات التي حملها المستخدم على الـ Pads أو السينث الداخلي)
         float* outL = buffer.getWritePointer (0);
         float* outR = (numOutChannels > 1) ? buffer.getWritePointer (1) : outL;
 
-        if (! intellAudioMuted.load() && activeOutputMidiNote >= 0)
+        if (! intellAudioMuted.load() && activeOutputMidiNote >= 0 && mode != ModeTriggersOnly)
         {
             int pc = ((activeOutputMidiNote % 12) + 12) % 12;
             float cents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
@@ -376,7 +618,6 @@ public:
                 float s = renderInternalSynthSample (synthPhase);
                 synthPhase += phaseInc;
                 if (synthPhase >= 1.0) synthPhase -= 1.0;
-
                 outL[i] += s * 0.22f;
                 outR[i] += s * 0.22f;
             }
@@ -388,45 +629,48 @@ public:
             for (int p = 0; p < 8; ++p)
             {
                 auto& pad = pads[p];
-                if (pad.playhead >= 0 && ! pad.muted && pad.sampleBuffer.getNumSamples() > 0)
+                if (pad.playhead >= 0 && ! pad.muted && pad.hasCustomSample && pad.sampleBuffer.getNumSamples() > 0)
                 {
                     const float* samp = pad.sampleBuffer.getReadPointer (0);
                     const int totalLen = pad.sampleBuffer.getNumSamples();
-
                     for (int i = 0; i < numSamples; ++i)
                     {
                         if (pad.playhead < totalLen)
                         {
-                            float v = samp[pad.playhead++] * 0.5f;
+                            float v = samp[pad.playhead++] * 0.65f;
                             outL[i] += v;
                             outR[i] += v;
                         }
-                        else
-                        {
-                            pad.playhead = -1;
-                            break;
-                        }
+                        else { pad.playhead = -1; break; }
                     }
                 }
             }
         }
     }
 
+    void stopActiveMelodyAndChords (juce::MidiBuffer& midiMessages)
+    {
+        if (activeOutputMidiNote >= 0)
+        {
+            emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, activeOutputMidiNote), midiMessages, 0);
+            emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, 8192), midiMessages, 0);
+        }
+        stopActiveChord (midiMessages);
+        activeOutputMidiNote = -1;
+        activeRawMidiNote = -1;
+        currentDetectedMidiNote.store (-1);
+        currentPitchBendValue.store (8192);
+        currentCentsOffset.store (0);
+    }
+
     int snapToMaqamScale (int midiNote) const
     {
         int pc = ((midiNote % 12) + 12) % 12;
-        if (noteStates[pc] > 0)
-            return midiNote;
-
+        if (noteStates[pc] > 0) return midiNote;
         for (int dist = 1; dist <= 6; ++dist)
         {
-            int downPc = (pc - dist + 12) % 12;
-            if (noteStates[downPc] > 0)
-                return midiNote - dist;
-
-            int upPc = (pc + dist) % 12;
-            if (noteStates[upPc] > 0)
-                return midiNote + dist;
+            if (noteStates[(pc - dist + 12) % 12] > 0) return midiNote - dist;
+            if (noteStates[(pc + dist) % 12] > 0)      return midiNote + dist;
         }
         return midiNote;
     }
@@ -435,41 +679,33 @@ public:
     {
         auto& pad = pads[padIdx];
         pad.flashAlpha = 1.0f;
-        pad.playhead = 0;
+        if (pad.hasCustomSample)
+            pad.playhead = 0;
 
-        midiMessages.addEvent (juce::MidiMessage::noteOn (triggersMidiChannel, pad.midiNote, (juce::uint8) 115), 0);
-        midiMessages.addEvent (juce::MidiMessage::noteOff (triggersMidiChannel, pad.midiNote), 64);
+        emitMidiEvent (juce::MidiMessage::noteOn  (triggersMidiChannel, pad.midiNote, (juce::uint8) 118), midiMessages, 0);
+        emitMidiEvent (juce::MidiMessage::noteOff (triggersMidiChannel, pad.midiNote), midiMessages, 64);
     }
 
     void triggerSmartOrientalChord (int rootMidi, juce::uint8 vel, juce::MidiBuffer& midiMessages)
     {
         stopActiveChord (midiMessages);
         int pc = ((rootMidi % 12) + 12) % 12;
-        bool isQuarterTone = (noteStates[pc] == 2);
-
-        if (isQuarterTone)
-        {
+        if (noteStates[pc] == 2)
             activeChordNotes = { rootMidi, rootMidi + 7, rootMidi + 12 };
-        }
         else
         {
-            int thirdCandidate = rootMidi + 4;
-            int thirdPc = ((thirdCandidate % 12) + 12) % 12;
+            int thirdPc = ((rootMidi + 4) % 12 + 12) % 12;
             int thirdInterval = (noteStates[thirdPc] == 1) ? 4 : 3;
-            activeChordNotes = { rootMidi, rootMidi + thirdInterval, rootMidi + 7 };
+            activeChordNotes = { rootMidi, rootMidi + thirdInterval, rootMidi + 7, rootMidi - 12 };
         }
-
-        if (chordRootBassline)
-            activeChordNotes.push_back (rootMidi - 12);
-
         for (int n : activeChordNotes)
-            midiMessages.addEvent (juce::MidiMessage::noteOn (chordsMidiChannel, n, (juce::uint8) (vel * 0.78f)), 0);
+            emitMidiEvent (juce::MidiMessage::noteOn (chordsMidiChannel, n, (juce::uint8) (vel * 0.82f)), midiMessages, 0);
     }
 
     void stopActiveChord (juce::MidiBuffer& midiMessages)
     {
         for (int n : activeChordNotes)
-            midiMessages.addEvent (juce::MidiMessage::noteOff (chordsMidiChannel, n), 0);
+            emitMidiEvent (juce::MidiMessage::noteOff (chordsMidiChannel, n), midiMessages, 0);
         activeChordNotes.clear();
     }
 
@@ -479,42 +715,19 @@ public:
         switch (synthPresetIndex)
         {
             case 0: return (float) (std::sin (twoPi * phase) * 0.55 + std::sin (twoPi * phase * 2.0) * 0.30 + std::sin (twoPi * phase * 3.0) * 0.15);
-            case 1: return (float) (std::sin (twoPi * phase) * 0.65 + std::sin (twoPi * phase * 3.0) * 0.25 + std::sin (twoPi * phase * 5.0) * 0.10);
-            case 2: return (float) (std::sin (twoPi * phase) * 0.70 + std::sin (twoPi * phase * 2.0) * 0.20);
-            case 3: return (float) (std::sin (twoPi * phase) * 0.80 + std::sin (twoPi * phase * 2.0) * 0.15);
-            case 4: return (phase < 0.5) ? 0.65f : -0.65f;
+            case 1: return (float) (std::sin (twoPi * phase) * 0.65 + std::sin (twoPi * phase * 3.0) * 0.25);
+            case 2: return (float) (std::sin (twoPi * phase) * 0.75 + std::sin (twoPi * phase * 2.0) * 0.20);
             default: return (float) std::sin (twoPi * phase);
-        }
-    }
-
-    void generateBuiltInPercussion (int padIndex)
-    {
-        const int len = (int) (44100 * 0.22);
-        pads[padIndex].sampleBuffer.setSize (1, len);
-        float* out = pads[padIndex].sampleBuffer.getWritePointer (0);
-        juce::Random rng (padIndex * 101 + 7);
-
-        for (int i = 0; i < len; ++i)
-        {
-            float t = (float) i / 44100.0f;
-            float env = std::exp (-t * (14.0f + padIndex * 3.0f));
-            float freq = (padIndex == 0 || padIndex == 7) ? (130.0f * std::exp (-t * 22.0f) + 48.0f)
-                                                          : (240.0f + padIndex * 95.0f);
-            float tone = std::sin (juce::MathConstants<float>::twoPi * freq * t);
-            float noise = (rng.nextFloat() * 2.0f - 1.0f) * ((padIndex == 0) ? 0.12f : 0.55f);
-            out[i] = (tone + noise) * env;
         }
     }
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
-
     const juce::String getName() const override { return "VOXN 2 Cyber Gold"; }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 0.0; }
-
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
     void setCurrentProgram (int) override {}
@@ -527,9 +740,8 @@ public:
         state.setProperty ("rootNote", rootNote, nullptr);
         state.setProperty ("maqamIndex", currentMaqamIndex, nullptr);
         state.setProperty ("quarterToneCents", quarterToneCents, nullptr);
-        state.setProperty ("stickiness", stickiness, nullptr);
-        state.setProperty ("intellMuted", intellAudioMuted.load(), nullptr);
-        state.setProperty ("trigMuted", trigAudioMuted.load(), nullptr);
+        state.setProperty ("targetStartOctave", targetStartOctave, nullptr);
+        state.setProperty ("semitoneTranspose", semitoneTranspose, nullptr);
         std::unique_ptr<juce::XmlElement> xml (state.createXml());
         copyXmlToBinary (*xml, destData);
     }
@@ -541,11 +753,10 @@ public:
         {
             auto state = juce::ValueTree::fromXml (*xmlState);
             rootNote = state.getProperty ("rootNote", 0);
-            currentMaqamIndex = state.getProperty ("maqamIndex", 0);
+            currentMaqamIndex = state.getProperty ("maqamIndex", 2);
             quarterToneCents = state.getProperty ("quarterToneCents", -50.0f);
-            stickiness = state.getProperty ("stickiness", 0.65f);
-            intellAudioMuted.store ((bool) state.getProperty ("intellMuted", false));
-            trigAudioMuted.store ((bool) state.getProperty ("trigMuted", false));
+            targetStartOctave = state.getProperty ("targetStartOctave", 0);
+            semitoneTranspose = state.getProperty ("semitoneTranspose", 0);
             applyMaqamPreset (rootNote, currentMaqamIndex);
         }
     }
@@ -554,41 +765,40 @@ public:
     std::array<int, 12> noteStates { 1, 0, 1, 0, 2, 1, 0, 1, 0, 1, 0, 2 };
 
     int rootNote = 0;
-    int currentMaqamIndex = 0;
+    int currentMaqamIndex = 2; // C Rast
     float quarterToneCents = -50.0f;
     float stickiness = 0.65f;
     float gateThreshold = 0.018f;
-    float triggerSensitivity = 0.72f;
+    float triggerSensitivity = 0.75f;
     int noteHoldFrames = 2;
     int pbRangeSemitones = 2;
+
+    // إعدادات الأوكتاف والنقل الجديدة
+    int targetStartOctave = 0; // 0 = Follow Voice, 1..5 = Lock output to Octave 1..5
+    int semitoneTranspose = 0; // -12 .. +12 Semitones
     int octaveShift = 0;
-    bool chordsEnabled = false;
-    bool chordRootBassline = true;
+
     bool truBendMode = false;
     int synthPresetIndex = 0;
+    int pitchMidiChannel = 1, chordsMidiChannel = 1, triggersMidiChannel = 1;
 
-    int pitchMidiChannel = 1;
-    int chordsMidiChannel = 2;
-    int triggersMidiChannel = 10;
+    float vowelAAA = 0.45f, vowelEEE = 0.30f, vowelOOO = 0.60f, vowelEnv = 0.50f;
 
-    int ccNumberAAA = 74;
-    int ccNumberEEE = 71;
-    int ccNumberOOO = 1;
-    int ccNumberENV = 11;
-
-    float vowelAAA = 0.45f;
-    float vowelEEE = 0.30f;
-    float vowelOOO = 0.60f;
-    float vowelEnv = 0.50f;
-
+    std::atomic<int>  exclusiveMode { ModeMelodyOnly };
+    std::atomic<int>  trainingPadIndex { -1 };
+    std::atomic<bool> pendingAllNotesOff { false };
+    std::atomic<bool> isCapturingMidi { false };
+    std::atomic<int>  capturedNoteCount { 0 };
     std::atomic<bool> intellAudioMuted { false };
     std::atomic<bool> trigAudioMuted   { false };
-    std::atomic<int> currentDetectedMidiNote { -1 };
-    std::atomic<int> currentPitchBendValue { 8192 };
-    std::atomic<int> currentCentsOffset { 0 };
+    std::atomic<int>  currentDetectedMidiNote { -1 };
+    std::atomic<int>  currentPitchBendValue { 8192 };
+    std::atomic<int>  currentCentsOffset { 0 };
     std::atomic<float> currentInputRms { 0.0f };
-    std::atomic<int> guiManualMidiNote { -1 };
-    std::atomic<int> pendingPadTrigger { -1 };
+    std::atomic<int>  guiManualMidiNote { -1 };
+    std::atomic<int>  pendingPadTrigger { -1 };
+
+    juce::String directMidiDeviceName { "Click to Select loopMIDI" };
 
 private:
     static constexpr int kYinWindowSize = 1024;
@@ -596,11 +806,9 @@ private:
     int yinWritePos = 0;
     double currentSampleRate = 44100.0;
     double synthPhase = 0.0;
+    float lpFilterState = 0.0f;
 
-    int activeRawMidiNote = -1;
-    int activeOutputMidiNote = -1;
-    int pendingCandidateNote = -1;
-    int confirmCounter = 0;
+    int activeRawMidiNote = -1, activeOutputMidiNote = -1, pendingCandidateNote = -1, confirmCounter = 0;
     float prevRms = 0.0f;
     int triggerCooldownSamples = 0;
 
@@ -608,9 +816,21 @@ private:
     juce::AudioFormatManager formatManager;
     juce::CriticalSection sampleLock;
 
+    juce::SpinLock directMidiLock;
+    std::unique_ptr<juce::MidiOutput> directMidiOut;
+    int directMidiDeviceIndex = -1;
+
+    juce::SpinLock captureLock;
+    juce::MidiMessageSequence capturedMidiSequence;
+    juce::int64 capturedSamplesElapsed = 0;
+    bool captureFirstEventReceived = false;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VoxN2AudioProcessor)
 };
 
+// ==============================================================================
+// الواجهة الرسومية (VoxN2AudioProcessorEditor)
+// ==============================================================================
 class VoxN2AudioProcessorEditor : public juce::AudioProcessorEditor,
                                   public juce::Timer,
                                   public juce::FileDragAndDropTarget
@@ -623,27 +843,13 @@ public:
         startTimerHz (30);
     }
 
-    ~VoxN2AudioProcessorEditor() override
-    {
-        stopTimer();
-    }
+    ~VoxN2AudioProcessorEditor() override { stopTimer(); }
 
     void timerCallback() override
     {
         for (auto& pad : proc.pads)
             if (pad.flashAlpha > 0.01f)
                 pad.flashAlpha *= 0.82f;
-
-        if (taqsimAutoPlaying)
-        {
-            taqsimStepCounter++;
-            if (taqsimStepCounter % 12 == 0)
-            {
-                static const int phrase[] = { 60, 62, 64, 65, 67, 65, 64, 62, 60, 71, 60 };
-                int idx = (taqsimStepCounter / 12) % 11;
-                proc.guiManualMidiNote.store (phrase[idx]);
-            }
-        }
         repaint();
     }
 
@@ -659,7 +865,6 @@ public:
     {
         if (files.isEmpty()) return;
         juce::File droppedFile (files[0]);
-
         for (int i = 0; i < 8; ++i)
         {
             if (padBounds[i].contains ((float) x, (float) y))
@@ -675,73 +880,76 @@ public:
     void openSampleChooserForPad (int padIndex)
     {
         fileChooser = std::make_unique<juce::FileChooser> (
-            "Select Custom Kick / Snare / Oriental Percussion (.wav, .mp3)",
-            juce::File{},
-            "*.wav;*.mp3;*.flac;*.ogg");
-
+            "Load Custom Kick / Snare / Loop (.wav, .mp3)", juce::File{}, "*.wav;*.mp3;*.flac;*.ogg");
         fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
             [this, padIndex] (const juce::FileChooser& fc)
             {
                 auto file = fc.getResult();
-                if (file.existsAsFile())
-                {
-                    proc.loadCustomSampleForPad (padIndex, file);
-                    repaint();
-                }
+                if (file.existsAsFile()) { proc.loadCustomSampleForPad (padIndex, file); repaint(); }
             });
     }
 
     void paint (juce::Graphics& g) override
     {
-        const juce::Colour bgDark     (0xff1b1b1f);
-        const juce::Colour cardDark   (0xff25252b);
-        const juce::Colour cyberGold  (0xffe5b84b);
-        const juce::Colour neonPink   (0xfff03e76);
-        const juce::Colour textBright (0xfff4f0e8);
-        const juce::Colour textMuted  (0xff8e8d96);
+        const juce::Colour bgDark (0xff1b1b1f), cardDark (0xff25252b), cyberGold (0xffe5b84b);
+        const juce::Colour neonPink (0xfff03e76), neonGreen (0xff2ecc71), textBright (0xfff4f0e8), textMuted (0xff8e8d96);
 
         g.fillAll (bgDark);
-
         g.setColour (juce::Colour (0xff141417));
         g.fillRect (0, 0, getWidth(), 42);
 
         g.setColour (cyberGold);
-        g.drawEllipse (14.0f, 10.0f, 22.0f, 22.0f, 2.0f);
-        g.setFont (juce::Font (15.0f, juce::Font::bold));
+        g.drawEllipse (12.0f, 10.0f, 22.0f, 22.0f, 2.0f);
+        g.setFont (juce::Font (14.5f, juce::Font::bold));
         g.setColour (textBright);
-        g.drawText ("VOXN 2", 42, 8, 65, 26, juce::Justification::centredLeft);
+        g.drawText ("VOXN 2", 38, 8, 60, 26, juce::Justification::centredLeft);
 
-        g.setColour (cyberGold);
-        g.setFont (juce::Font (12.0f, juce::Font::bold));
-        g.drawText ("CYBER GOLD", 108, 8, 90, 26, juce::Justification::centredLeft);
+        // أزرار العزل الحصري الثلاثة
+        const int activeMode = proc.exclusiveMode.load();
+        const char* modeNames[3] = { "1. MELODY ONLY", "2. TRIGGERS ONLY", "3. CHORDS ONLY" };
+        for (int m = 0; m < 3; ++m)
+        {
+            exclusiveModeRects[m] = { 105.0f + m * 124.0f, 8.0f, 118.0f, 26.0f };
+            bool isCurr = (activeMode == m);
+            g.setColour (isCurr ? (m == 1 ? neonPink : cyberGold) : juce::Colour (0xff23232a));
+            g.fillRoundedRectangle (exclusiveModeRects[m], 5.0f);
+            g.setColour (isCurr ? juce::Colours::black : textBright);
+            g.setFont (juce::Font (10.5f, juce::Font::bold));
+            g.drawText (modeNames[m], exclusiveModeRects[m], juce::Justification::centred);
+        }
 
-        taqsimButtonRect = { 710.0f, 8.0f, 130.0f, 26.0f };
-        g.setColour (taqsimAutoPlaying ? neonPink : cyberGold);
-        g.fillRoundedRectangle (taqsimButtonRect, 6.0f);
+        // شريط MIDI Capture & Drag-to-DAW
+        bool isRec = proc.isCapturingMidi.load();
+        int noteCnt = proc.capturedNoteCount.load();
+
+        midiRecButtonRect = { 482.0f, 8.0f, 112.0f, 26.0f };
+        g.setColour (isRec ? neonPink : juce::Colour (0xff2a2a32));
+        g.fillRoundedRectangle (midiRecButtonRect, 5.0f);
+        g.setColour (textBright);
+        g.drawText (isRec ? ("STOP [" + juce::String (noteCnt) + "]") : "● REC MIDI", midiRecButtonRect, juce::Justification::centred);
+
+        midiDragButtonRect = { 600.0f, 8.0f, 185.0f, 26.0f };
+        g.setColour (noteCnt > 0 ? neonGreen : cyberGold);
+        g.fillRoundedRectangle (midiDragButtonRect, 5.0f);
         g.setColour (juce::Colours::black);
-        g.setFont (juce::Font (12.0f, juce::Font::bold));
-        g.drawText (taqsimAutoPlaying ? "STOP TAQSIM" : "CYFER TAQSIM", taqsimButtonRect, juce::Justification::centred);
+        g.drawText ("DRAG MIDI TO DAW (" + juce::String (noteCnt) + ")", midiDragButtonRect, juce::Justification::centred);
 
-        juce::Rectangle<float> micBadge (848.0f, 8.0f, 96.0f, 26.0f);
-        g.setColour (juce::Colour (0xff26262e));
-        g.fillRoundedRectangle (micBadge, 6.0f);
-        g.setColour (cyberGold.withAlpha (0.6f));
-        g.drawRoundedRectangle (micBadge, 6.0f, 1.0f);
+        midiClearButtonRect = { 792.0f, 8.0f, 65.0f, 26.0f };
+        g.setColour (juce::Colour (0xff2a2a32));
+        g.fillRoundedRectangle (midiClearButtonRect, 5.0f);
         g.setColour (textBright);
-        g.setFont (11.5f);
-        g.drawText ("MIC LIVE", micBadge, juce::Justification::centred);
+        g.drawText ("CLEAR", midiClearButtonRect, juce::Justification::centred);
 
-        const char* tabTitles[5] = { "Play", "Train (Kit)", "Key (Maqam)", "Chords", "Assign (MIDI)" };
+        // التبويبات الخمسة
+        const char* tabTitles[5] = { "Play", "Train (Beatbox)", "Key (Maqam/Scale)", "Chords", "Assign (MIDI)" };
         for (int i = 0; i < 5; ++i)
         {
-            tabRects[i] = { 160.0f + i * 128.0f, 46.0f, 122.0f, 30.0f };
+            tabRects[i] = { 130.0f + i * 144.0f, 46.0f, 138.0f, 30.0f };
             bool isCurr = (currentTab == i);
             g.setColour (isCurr ? cardDark : juce::Colour (0xff19191e));
             g.fillRoundedRectangle (tabRects[i], 6.0f);
-            g.setColour (isCurr ? cyberGold : textMuted.withAlpha (0.3f));
-            g.drawRoundedRectangle (tabRects[i], 6.0f, isCurr ? 1.5f : 1.0f);
             g.setColour (isCurr ? cyberGold : textMuted);
-            g.setFont (juce::Font (12.5f, juce::Font::bold));
+            g.setFont (juce::Font (12.0f, juce::Font::bold));
             g.drawText (tabTitles[i], tabRects[i], juce::Justification::centred);
         }
 
@@ -751,124 +959,73 @@ public:
         g.setColour (cyberGold.withAlpha (0.28f));
         g.drawRoundedRectangle (mainCard, 10.0f, 1.2f);
 
-        float rmsNorm = juce::jlimit (0.0f, 1.0f, proc.currentInputRms.load() * 10.0f);
-        for (int d = 0; d < 28; ++d)
-        {
-            float dy = 395.0f - d * 11.0f;
-            bool lit = ((float) d / 28.0f) <= rmsNorm;
-            g.setColour (lit ? (d > 20 ? neonPink : cyberGold) : textMuted.withAlpha (0.25f));
-            g.fillEllipse (11.0f, dy, 4.0f, 4.0f);
-        }
-
-        if      (currentTab == 0) drawPlayTab   (g, cyberGold, neonPink, textBright, textMuted);
-        else if (currentTab == 1) drawTrainTab  (g, cyberGold, neonPink, textBright, textMuted);
+        if      (currentTab == 0) drawPlayTab   (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
+        else if (currentTab == 1) drawTrainTab  (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
         else if (currentTab == 2) drawKeyTab    (g, cyberGold, neonPink, textBright, textMuted);
-        else if (currentTab == 3) drawChordsTab (g, cyberGold, neonPink, textBright, textMuted);
-        else if (currentTab == 4) drawAssignTab (g, cyberGold, neonPink, textBright, textMuted);
+        else if (currentTab == 3) drawChordsTab (g, cyberGold, neonPink, textBright);
+        else if (currentTab == 4) drawAssignTab (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
 
-        drawBottomSection (g, cyberGold, neonPink, textBright, textMuted);
+        drawBottomSection (g, cyberGold, neonPink, neonGreen, textBright);
     }
 
-    void drawPlayTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour muted)
+    void drawPlayTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
     {
-        g.setColour (gold);
-        g.setFont (juce::Font (12.5f, juce::Font::bold));
-        g.drawText ("TRIGGERS (DRAG WAV/MP3 OR CLICK [WAV])", 44, 82, 280, 20, juce::Justification::centredLeft);
+        const bool triggersActive = (proc.exclusiveMode.load() == ModeTriggersOnly);
+        g.setColour (triggersActive ? pink : gold);
+        g.setFont (juce::Font (11.5f, juce::Font::bold));
+        g.drawText ("FPC DRUM PADS (EMPTY BY DEFAULT - DROP WAV/MP3):", 44, 80, 310, 22, juce::Justification::centredLeft);
 
-        for (int i = 0; i < 9; ++i)
+        for (int i = 0; i < 8; ++i)
         {
-            int row = i / 3;
-            int col = i % 3;
+            int row = i / 3, col = i % 3;
             juce::Rectangle<float> r (44.0f + col * 92.0f, 108.0f + row * 96.0f, 84.0f, 88.0f);
+            padBounds[i] = r;
+            auto& pad = proc.pads[i];
 
-            if (i < 8)
+            g.setColour (juce::Colour (0xff1d1d22).interpolatedWith (pink, pad.flashAlpha * 0.5f));
+            g.fillRoundedRectangle (r, 7.0f);
+            g.setColour (pad.hasCustomSample ? gold : muted.withAlpha (0.4f));
+            g.drawRoundedRectangle (r, 7.0f, 1.4f);
+
+            padLoadRects[i] = { r.getX() + 4.0f, r.getY() + 4.0f, 34.0f, 16.0f };
+            g.setColour (gold.withAlpha (0.25f));
+            g.fillRoundedRectangle (padLoadRects[i], 3.0f);
+            g.setColour (gold);
+            g.setFont (9.0f);
+            g.drawText ("LOAD", padLoadRects[i], juce::Justification::centred);
+
+            // شارة هل المربع مدرب صوتياً أم لا
+            if (pad.isVoiceTrained)
             {
-                padBounds[i] = r;
-                auto& pad = proc.pads[i];
-                juce::Colour borderCol = (row == 0) ? pink : gold;
-
-                g.setColour (juce::Colour (0xff1d1d22).interpolatedWith (borderCol, pad.flashAlpha * 0.45f));
-                g.fillRoundedRectangle (r, 7.0f);
-                g.setColour (borderCol.withAlpha (0.75f + pad.flashAlpha * 0.25f));
-                g.drawRoundedRectangle (r, 7.0f, 1.4f);
-
-                padLoadRects[i] = { r.getX() + 5.0f, r.getY() + 5.0f, 24.0f, 16.0f };
-                g.setColour (gold.withAlpha (0.22f));
-                g.fillRoundedRectangle (padLoadRects[i], 3.0f);
-                g.setColour (gold);
-                g.setFont (9.5f);
-                g.drawText ("WAV", padLoadRects[i], juce::Justification::centred);
-
-                padMuteRects[i] = { r.getRight() - 29.0f, r.getY() + 5.0f, 24.0f, 16.0f };
-                g.setColour (pad.muted ? pink : juce::Colour (0xff32323a));
-                g.fillRoundedRectangle (padMuteRects[i], 3.0f);
-                g.setColour (bright);
-                g.drawText (pad.muted ? "M" : "ON", padMuteRects[i], juce::Justification::centred);
-
-                g.setColour (bright);
-                g.setFont (juce::Font (11.0f, juce::Font::bold));
-                g.drawText (pad.name, (int) r.getX() + 5, (int) r.getY() + 42, (int) r.getWidth() - 10, 18, juce::Justification::centredLeft);
-
-                g.setColour (pad.hasCustomSample ? gold : muted);
-                g.setFont (10.0f);
-                g.drawText (pad.hasCustomSample ? ("[" + pad.customFileName + "]") : pad.subLabel,
-                            (int) r.getX() + 5, (int) r.getY() + 62, (int) r.getWidth() - 10, 16, juce::Justification::centredLeft);
+                g.setColour (green);
+                g.drawText ("MIC OK", (int) r.getRight() - 42, (int) r.getY() + 4, 38, 16, juce::Justification::centredRight);
             }
-            else
-            {
-                g.setColour (juce::Colour (0xff1d1d22));
-                g.fillRoundedRectangle (r, 7.0f);
-                g.setColour (gold.withAlpha (0.35f));
-                g.drawRoundedRectangle (r, 7.0f, 1.0f);
-                g.setFont (20.0f);
-                g.drawText ("+", r, juce::Justification::centred);
-            }
+
+            g.setColour (bright);
+            g.setFont (juce::Font (11.0f, juce::Font::bold));
+            g.drawText (pad.name, (int) r.getX() + 5, (int) r.getY() + 36, 74, 18, juce::Justification::centredLeft);
+
+            g.setColour (pad.hasCustomSample ? gold : muted);
+            g.setFont (9.5f);
+            g.drawText (pad.hasCustomSample ? pad.customFileName : "[Empty Pad]",
+                        (int) r.getX() + 5, (int) r.getY() + 58, 74, 18, juce::Justification::centredLeft);
         }
 
-        drawPitchRadarWheel (g, 488.0f, 248.0f, 122.0f, gold, pink, bright, muted);
+        drawPitchRadarWheel (g, 495.0f, 245.0f, 120.0f, gold, pink, bright);
 
         g.setColour (muted);
         g.setFont (11.5f);
-        g.drawText ("Stickiness (Hysteresis):", 635, 82, 130, 20, juce::Justification::centredLeft);
-        stickinessSliderRect = { 768.0f, 86.0f, 155.0f, 12.0f };
+        g.drawText ("Stickiness:", 680, 82, 80, 20, juce::Justification::centredLeft);
+        stickinessSliderRect = { 760.0f, 86.0f, 160.0f, 12.0f };
         g.setColour (juce::Colour (0xff16161a));
         g.fillRoundedRectangle (stickinessSliderRect, 6.0f);
         g.setColour (pink);
         g.fillRoundedRectangle (stickinessSliderRect.getX(), stickinessSliderRect.getY(),
                                 stickinessSliderRect.getWidth() * proc.stickiness, 12.0f, 6.0f);
-
-        const float cx = 795.0f, cy = 248.0f, offset = 64.0f;
-        struct VowelNode { const char* label; float x; float y; float val; juce::Colour col; };
-        VowelNode nodes[4] = {
-            { "aaa", cx,          cy - offset, proc.vowelAAA, gold },
-            { "eee", cx - offset, cy,          proc.vowelEEE, pink },
-            { "ooo", cx + offset, cy,          proc.vowelOOO, pink },
-            { "env", cx,          cy + offset, proc.vowelEnv, gold }
-        };
-
-        for (int i = 0; i < 4; ++i)
-        {
-            vowelRects[i] = { nodes[i].x - 28.0f, nodes[i].y - 28.0f, 56.0f, 56.0f };
-            g.setColour (juce::Colour (0xff19191f));
-            g.fillEllipse (vowelRects[i]);
-            g.setColour (nodes[i].col.withAlpha (0.35f));
-            g.drawEllipse (vowelRects[i], 2.0f);
-
-            juce::Path arc;
-            arc.addCentredArc (nodes[i].x, nodes[i].y, 28.0f, 28.0f, 0.0f,
-                               -juce::MathConstants<float>::halfPi,
-                               -juce::MathConstants<float>::halfPi + nodes[i].val * juce::MathConstants<float>::twoPi, true);
-            g.setColour (nodes[i].col);
-            g.strokePath (arc, juce::PathStrokeType (3.2f));
-
-            g.setColour (bright);
-            g.setFont (juce::Font (12.0f, juce::Font::bold));
-            g.drawText (nodes[i].label, vowelRects[i], juce::Justification::centred);
-        }
     }
 
     void drawPitchRadarWheel (juce::Graphics& g, float cx, float cy, float radius,
-                              juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour)
+                              juce::Colour gold, juce::Colour pink, juce::Colour bright)
     {
         int activeMidi = proc.currentDetectedMidiNote.load();
         int activePc = (activeMidi >= 0) ? ((activeMidi % 12) + 12) % 12 : -1;
@@ -878,27 +1035,15 @@ public:
             float angleDeg = (float) i * 30.0f - 90.0f;
             float a1 = juce::degreesToRadians (angleDeg - 13.0f);
             float a2 = juce::degreesToRadians (angleDeg + 13.0f);
-
             int state = proc.noteStates[i];
             bool isPlaying = (i == activePc);
 
             juce::Path seg;
             seg.addPieSegment (cx - radius, cy - radius, radius * 2.0f, radius * 2.0f,
-                               a1 + juce::MathConstants<float>::halfPi,
-                               a2 + juce::MathConstants<float>::halfPi, 0.56f);
+                               a1 + juce::MathConstants<float>::halfPi, a2 + juce::MathConstants<float>::halfPi, 0.56f);
 
-            if (state == 0)
-                g.setColour (juce::Colour (0xff18181c));
-            else if (isPlaying)
-                g.setColour (state == 2 ? gold : pink);
-            else if (state == 2)
-                g.setColour (gold.withAlpha (0.28f));
-            else
-                g.setColour (juce::Colour (0xff32323b));
-
+            g.setColour (state == 0 ? juce::Colour (0xff18181c) : (isPlaying ? (state == 2 ? gold : pink) : (state == 2 ? gold.withAlpha (0.3f) : juce::Colour (0xff32323b))));
             g.fillPath (seg);
-            g.setColour (state == 2 ? gold : pink.withAlpha (0.35f));
-            g.strokePath (seg, juce::PathStrokeType (1.2f));
 
             float midRad = juce::degreesToRadians (angleDeg);
             float tx = cx + std::cos (midRad) * (radius * 0.78f);
@@ -908,40 +1053,34 @@ public:
             if (state > 0)
             {
                 g.setColour (isPlaying ? juce::Colours::black : bright);
-                g.setFont (juce::Font (11.5f, juce::Font::bold));
-                juce::String label = kNoteNames[i];
-                if (state == 2) label += " 1/2b";
-                g.drawText (label, (int) tx - 22, (int) ty - 10, 44, 20, juce::Justification::centred);
+                g.setFont (juce::Font (11.0f, juce::Font::bold));
+                g.drawText (juce::String (kNoteNames[i]) + (state == 2 ? " 1/2b" : ""), (int) tx - 22, (int) ty - 10, 44, 20, juce::Justification::centred);
             }
         }
 
         g.setColour (juce::Colour (0xff19191f));
-        g.fillEllipse (cx - 48.0f, cy - 48.0f, 96.0f, 96.0f);
+        g.fillEllipse (cx - 46.0f, cy - 46.0f, 92.0f, 92.0f);
         g.setColour (gold);
-        g.drawEllipse (cx - 48.0f, cy - 48.0f, 96.0f, 96.0f, 2.2f);
+        g.drawEllipse (cx - 46.0f, cy - 46.0f, 92.0f, 92.0f, 2.0f);
 
-        juce::String centerNote = (activeMidi >= 0)
-            ? (juce::String (kNoteNames[activePc]) + juce::String (activeMidi / 12 - 1))
-            : "READY";
+        juce::String centerNote = (activeMidi >= 0) ? (juce::String (kNoteNames[activePc]) + juce::String (activeMidi / 12 - 1)) : "READY";
         g.setColour (bright);
-        g.setFont (juce::Font (16.0f, juce::Font::bold));
-        g.drawText (centerNote, (int) cx - 40, (int) cy - 18, 80, 22, juce::Justification::centred);
-
-        g.setColour (gold);
-        g.setFont (11.0f);
-        int cents = proc.currentCentsOffset.load();
-        g.drawText (juce::String (cents) + " cents", (int) cx - 40, (int) cy + 4, 80, 18, juce::Justification::centred);
+        g.setFont (juce::Font (15.0f, juce::Font::bold));
+        g.drawText (centerNote, (int) cx - 40, (int) cy - 12, 80, 24, juce::Justification::centred);
     }
 
-    void drawTrainTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour muted)
+    // ==========================================================================
+    // نافذة TRAIN: مدرب الصوت التفاعلي السهل (3 ضربات فقط) + تحميل الخامات
+    // ==========================================================================
+    void drawTrainTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
     {
         g.setColour (gold);
         g.setFont (juce::Font (13.0f, juce::Font::bold));
-        g.drawText ("SELECT PAD TO TRAIN OR LOAD CUSTOM WAV/MP3:", 48, 88, 360, 22, juce::Justification::centredLeft);
+        g.drawText ("1. SELECT A PAD   ->   2. LOAD YOUR WAV/MP3   ->   3. TRAIN YOUR BEATBOX VOICE (3 HITS):", 48, 84, 760, 22, juce::Justification::centredLeft);
 
         for (int i = 0; i < 8; ++i)
         {
-            juce::Rectangle<float> r (48.0f + (i % 2) * 145.0f, 118.0f + (i / 2) * 65.0f, 135.0f, 54.0f);
+            juce::Rectangle<float> r (48.0f + (i % 2) * 150.0f, 116.0f + (i / 2) * 66.0f, 140.0f, 56.0f);
             padBounds[i] = r;
             bool sel = (selectedTrainPad == i);
             g.setColour (sel ? gold.withAlpha (0.22f) : juce::Colour (0xff1b1b20));
@@ -951,77 +1090,89 @@ public:
 
             g.setColour (bright);
             g.setFont (juce::Font (12.0f, juce::Font::bold));
-            g.drawText (proc.pads[i].name, r.reduced (8.0f), juce::Justification::topLeft);
+            g.drawText (proc.pads[i].name + (proc.pads[i].isVoiceTrained ? " [TRAINED]" : ""), r.reduced (8.0f), juce::Justification::topLeft);
+
             g.setColour (proc.pads[i].hasCustomSample ? gold : muted);
             g.setFont (10.5f);
-            g.drawText (proc.pads[i].hasCustomSample ? proc.pads[i].customFileName : proc.pads[i].subLabel,
-                        r.reduced (8.0f), juce::Justification::bottomLeft);
+            g.drawText (proc.pads[i].hasCustomSample ? proc.pads[i].customFileName : "[Empty - No Sample]", r.reduced (8.0f), juce::Justification::bottomLeft);
         }
 
-        float cx = 520.0f, cy = 245.0f, rad = 95.0f;
-        for (int t = 0; t < 12; ++t)
-        {
-            float a = juce::degreesToRadians ((float) t * 30.0f - 90.0f);
-            float tx = cx + std::cos (a) * rad;
-            float ty = cy + std::sin (a) * rad;
-            g.setColour (t < proc.pads[selectedTrainPad].trainedTakes ? gold : juce::Colour (0xff18181d));
-            g.fillEllipse (tx - 11.0f, ty - 11.0f, 22.0f, 22.0f);
-        }
+        // دائرة حالة التدريب الصوتي في المنتصف (3 خطوات واضحة)
+        auto& currPad = proc.pads[selectedTrainPad];
+        bool isListeningNow = (proc.trainingPadIndex.load() == selectedTrainPad);
+        float cx = 505.0f, cy = 242.0f;
+
+        g.setColour (juce::Colour (0xff191920));
+        g.fillEllipse (cx - 88.0f, cy - 88.0f, 176.0f, 176.0f);
+        g.setColour (isListeningNow ? pink : (currPad.isVoiceTrained ? green : gold));
+        g.drawEllipse (cx - 88.0f, cy - 88.0f, 176.0f, 176.0f, 3.5f);
 
         g.setColour (bright);
-        g.setFont (juce::Font (15.0f, juce::Font::bold));
-        g.drawText ("12 / 12 TAKES", (int) cx - 65, (int) cy - 12, 130, 24, juce::Justification::centred);
+        g.setFont (juce::Font (14.0f, juce::Font::bold));
+        juce::String statusText = isListeningNow
+            ? ("SPEAK NOW!\nHit " + juce::String (currPad.trainedHits) + " / 3")
+            : (currPad.isVoiceTrained ? "VOICE TRAINED!\n(Ready)" : "NOT TRAINED\nClick Train ->");
+        g.drawFittedText (statusText, (int) cx - 70, (int) cy - 30, 140, 60, juce::Justification::centred, 2);
 
-        trainLoadButtonRect   = { 690.0f, 150.0f, 220.0f, 38.0f };
-        trainPlayButtonRect   = { 690.0f, 202.0f, 220.0f, 38.0f };
-        trainRevertButtonRect = { 690.0f, 254.0f, 220.0f, 38.0f };
+        // أزرار التحكم على اليمين
+        trainVoiceBtnRect  = { 650.0f, 125.0f, 270.0f, 44.0f };
+        trainLoadButtonRect = { 650.0f, 182.0f, 270.0f, 40.0f };
+        trainPlayButtonRect = { 650.0f, 234.0f, 270.0f, 40.0f };
+        trainRevertButtonRect = { 650.0f, 286.0f, 270.0f, 40.0f };
+
+        g.setColour (isListeningNow ? green : pink);
+        g.fillRoundedRectangle (trainVoiceBtnRect, 7.0f);
+        g.setColour (bright);
+        g.setFont (juce::Font (12.5f, juce::Font::bold));
+        g.drawText (isListeningNow ? "LISTENING... MAKE SOUND 3 TIMES!" : "🎤 TRAIN VOICE (MAKE SOUND 3X)", trainVoiceBtnRect, juce::Justification::centred);
 
         g.setColour (gold);
-        g.fillRoundedRectangle (trainLoadButtonRect, 6.0f);
+        g.fillRoundedRectangle (trainLoadButtonRect, 7.0f);
         g.setColour (juce::Colours::black);
-        g.setFont (juce::Font (12.5f, juce::Font::bold));
-        g.drawText ("LOAD CUSTOM WAV / MP3", trainLoadButtonRect, juce::Justification::centred);
-
-        g.setColour (pink);
-        g.fillRoundedRectangle (trainPlayButtonRect, 6.0f);
-        g.setColour (bright);
-        g.drawText ("AUDITION / PLAY PAD", trainPlayButtonRect, juce::Justification::centred);
+        g.drawText ("📁 LOAD SAMPLE (.WAV / .MP3)", trainLoadButtonRect, juce::Justification::centred);
 
         g.setColour (juce::Colour (0xff32323b));
-        g.fillRoundedRectangle (trainRevertButtonRect, 6.0f);
+        g.fillRoundedRectangle (trainPlayButtonRect, 7.0f);
         g.setColour (bright);
-        g.drawText ("REVERT TO BUILT-IN SOUND", trainRevertButtonRect, juce::Justification::centred);
+        g.drawText ("▶ TEST / PLAY PAD SOUND", trainPlayButtonRect, juce::Justification::centred);
+
+        g.setColour (juce::Colour (0xff292226));
+        g.fillRoundedRectangle (trainRevertButtonRect, 7.0f);
+        g.setColour (bright);
+        g.drawText ("🗑️ CLEAR PAD SAMPLE & TRAINING", trainRevertButtonRect, juce::Justification::centred);
     }
 
+    // ==========================================================================
+    // نافذة KEY: تضم Major و Minor + المقامات الشرقية + إعدادات الأوكتاف
+    // ==========================================================================
     void drawKeyTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour muted)
     {
-        drawPitchRadarWheel (g, 220.0f, 242.0f, 118.0f, gold, pink, bright, muted);
+        drawPitchRadarWheel (g, 200.0f, 242.0f, 115.0f, gold, pink, bright);
 
         g.setColour (gold);
         g.setFont (juce::Font (13.0f, juce::Font::bold));
-        g.drawText ("ORIENTAL MAQAM PRESETS & QUARTER-TONE DEPTH (1/2b):", 395, 86, 480, 22, juce::Justification::centredLeft);
+        g.drawText ("SCALES & MAQAMAT (MAJOR, MINOR & ORIENTAL):", 365, 84, 520, 22, juce::Justification::centredLeft);
 
-        for (int m = 0; m < 8; ++m)
+        for (int m = 0; m < 10; ++m)
         {
-            maqamPresetRects[m] = { 395.0f + (m % 2) * 255.0f, 118.0f + (m / 2) * 52.0f, 240.0f, 42.0f };
+            maqamPresetRects[m] = { 365.0f + (m % 2) * 275.0f, 112.0f + (m / 2) * 44.0f, 260.0f, 38.0f };
             bool active = (proc.currentMaqamIndex == m);
-            g.setColour (active ? gold.withAlpha (0.25f) : juce::Colour (0xff1b1b20));
+            g.setColour (active ? gold.withAlpha (0.28f) : juce::Colour (0xff1b1b20));
             g.fillRoundedRectangle (maqamPresetRects[m], 6.0f);
             g.setColour (active ? gold : muted.withAlpha (0.35f));
             g.drawRoundedRectangle (maqamPresetRects[m], 6.0f, 1.3f);
 
             g.setColour (bright);
-            g.setFont (juce::Font (13.0f, juce::Font::bold));
+            g.setFont (juce::Font (12.5f, juce::Font::bold));
             g.drawText (juce::String (kMaqamat[m].nameEn) + "  (" + juce::String::fromUTF8 (kMaqamat[m].nameAr) + ")",
-                        maqamPresetRects[m].reduced (12.0f), juce::Justification::centredLeft);
+                        maqamPresetRects[m].reduced (10.0f), juce::Justification::centredLeft);
         }
 
         g.setColour (bright);
-        g.setFont (12.5f);
-        g.drawText ("Quarter-Tone Depth: " + juce::String ((int) proc.quarterToneCents) + " cents",
-                    395, 342, 240, 22, juce::Justification::centredLeft);
+        g.setFont (12.0f);
+        g.drawText ("Quarter-Tone Depth: " + juce::String ((int) proc.quarterToneCents) + " cents", 365, 342, 230, 22, juce::Justification::centredLeft);
 
-        qtDepthSliderRect = { 625.0f, 346.0f, 265.0f, 14.0f };
+        qtDepthSliderRect = { 595.0f, 346.0f, 290.0f, 14.0f };
         g.setColour (juce::Colour (0xff16161a));
         g.fillRoundedRectangle (qtDepthSliderRect, 7.0f);
         float normQt = (proc.quarterToneCents - (-65.0f)) / 30.0f;
@@ -1030,18 +1181,11 @@ public:
                                 qtDepthSliderRect.getWidth() * juce::jlimit (0.0f, 1.0f, normQt), 14.0f, 7.0f);
     }
 
-    void drawChordsTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour)
+    void drawChordsTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright)
     {
         g.setColour (gold);
         g.setFont (juce::Font (13.5f, juce::Font::bold));
-        g.drawText ("SMART ORIENTAL CHORDS (AUTO 5TH POWER ON QUARTER-TONE DEGREES):", 48, 88, 620, 22, juce::Justification::centredLeft);
-
-        chordsToggleRect = { 48.0f, 124.0f, 210.0f, 40.0f };
-        g.setColour (proc.chordsEnabled ? pink : juce::Colour (0xff32323b));
-        g.fillRoundedRectangle (chordsToggleRect, 7.0f);
-        g.setColour (bright);
-        g.setFont (juce::Font (13.0f, juce::Font::bold));
-        g.drawText (proc.chordsEnabled ? "CHORDS: ENABLED" : "CHORDS: OFF (CLICK)", chordsToggleRect, juce::Justification::centred);
+        g.drawText ("SMART ORIENTAL & WESTERN CHORDS (AUTO 5TH POWER ON QUARTER-TONES):", 48, 88, 660, 22, juce::Justification::centredLeft);
 
         const char* roman[7] = { "I", "II", "III", "IV", "V", "VI", "VII" };
         int degIdx = 0;
@@ -1050,81 +1194,95 @@ public:
             int note = (proc.rootNote + pc) % 12;
             if (proc.noteStates[note] > 0)
             {
-                juce::Rectangle<float> col (48.0f + degIdx * 124.0f, 182.0f, 114.0f, 195.0f);
+                juce::Rectangle<float> col (48.0f + degIdx * 124.0f, 140.0f, 114.0f, 220.0f);
                 bool isQt = (proc.noteStates[note] == 2);
                 g.setColour (juce::Colour (0xff1b1b20));
                 g.fillRoundedRectangle (col, 7.0f);
-                g.setColour (isQt ? gold : pink.withAlpha (0.5f));
+                g.setColour (isQt ? gold : pink);
                 g.drawRoundedRectangle (col, 7.0f, 1.4f);
 
                 g.setColour (bright);
                 g.setFont (juce::Font (14.0f, juce::Font::bold));
-                g.drawText (juce::String (roman[degIdx]) + " - " + kNoteNames[note], col.removeFromTop (36.0f), juce::Justification::centred);
-
+                g.drawText (juce::String (roman[degIdx]) + " - " + kNoteNames[note], col.removeFromTop (40.0f), juce::Justification::centred);
                 g.setColour (isQt ? gold : bright);
-                g.setFont (12.0f);
-                g.drawText (isQt ? "5th Power\n(Quarter-Safe)" : "Maqam Triad\n+ Bassline", col, juce::Justification::centred);
+                g.drawText (isQt ? "5th Power\n(Quarter-Safe)" : "Scale Triad\n+ Bassline", col, juce::Justification::centred);
                 ++degIdx;
             }
         }
     }
 
-    void drawAssignTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour muted)
+    void drawAssignTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
     {
         g.setColour (gold);
         g.setFont (juce::Font (13.5f, juce::Font::bold));
-        g.drawText ("MIDI ROUTING & PITCH TRACKING MODE (FL STUDIO / DAW):", 48, 88, 520, 22, juce::Justification::centredLeft);
+        g.drawText ("DIRECT HARDWARE MIDI EMULATION (RECORD LIVE IN FL STUDIO):", 48, 88, 680, 22, juce::Justification::centredLeft);
 
-        bendModeRect = { 48.0f, 130.0f, 260.0f, 44.0f };
-        g.setColour (proc.truBendMode ? pink : gold);
-        g.fillRoundedRectangle (bendModeRect, 7.0f);
+        directMidiBtnRect = { 48.0f, 130.0f, 420.0f, 44.0f };
+        g.setColour (green);
+        g.fillRoundedRectangle (directMidiBtnRect, 7.0f);
         g.setColour (juce::Colours::black);
         g.setFont (juce::Font (13.0f, juce::Font::bold));
-        g.drawText (proc.truBendMode ? "MODE: TruBend (Mawal)" : "MODE: IntelliBend (Maqam Lock)", bendModeRect, juce::Justification::centred);
+        g.drawText ("DIRECT MIDI OUT: " + proc.directMidiDeviceName + " (CLICK)", directMidiBtnRect, juce::Justification::centred);
 
         g.setColour (bright);
         g.setFont (13.0f);
-        g.drawText ("Pitch + Quarter-Tone MIDI Channel: Ch " + juce::String (proc.pitchMidiChannel)
-                    + "   |   Chords Channel: Ch " + juce::String (proc.chordsMidiChannel)
-                    + "   |   Triggers Channel: Ch " + juce::String (proc.triggersMidiChannel),
-                    48, 198, 700, 26, juce::Justification::centredLeft);
-
-        g.setColour (muted);
-        g.drawText ("Vowel CC Mapping:   AAA -> CC 74 (Cutoff)   |   EEE -> CC 71 (Resonance)   |   OOO -> CC 1 (Mod)   |   ENV -> CC 11 (Expression)",
-                    48, 236, 820, 26, juce::Justification::centredLeft);
+        g.drawText ("1. Run loopMIDI and enable 'loopMIDI Port' in FL Studio -> Options -> MIDI Settings -> Input.", 48, 195, 780, 24, juce::Justification::centredLeft);
+        g.drawText ("2. Or click [REC MIDI] in the top bar, sing, and drag [DRAG MIDI TO DAW] directly into FL Studio's Piano Roll!", 48, 225, 780, 24, juce::Justification::centredLeft);
     }
 
-    void drawBottomSection (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour bright, juce::Colour)
+    // ==========================================================================
+    // القسم السفلي: اختيار المقام + تحديد أوكتاف البداية (Out Oct) + Semitone (-12..+12)
+    // ==========================================================================
+    void drawBottomSection (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright)
     {
-        g.setColour (bright);
-        g.setFont (juce::Font (12.0f, juce::Font::bold));
-        g.drawText ("PB: +/-" + juce::String (proc.pbRangeSemitones), 120, 416, 70, 22, juce::Justification::centredLeft);
-
-        rootCycleRect = { 210.0f, 415.0f, 74.0f, 24.0f };
+        rootCycleRect = { 114.0f, 414.0f, 68.0f, 25.0f };
         g.setColour (juce::Colour (0xff26262e));
         g.fillRoundedRectangle (rootCycleRect, 5.0f);
         g.setColour (gold);
+        g.setFont (juce::Font (11.5f, juce::Font::bold));
         g.drawText ("Key: " + juce::String (kNoteNames[proc.rootNote]), rootCycleRect, juce::Justification::centred);
 
-        maqamCycleRect = { 292.0f, 415.0f, 140.0f, 24.0f };
+        maqamCycleRect = { 188.0f, 414.0f, 130.0f, 25.0f };
         g.setColour (juce::Colour (0xff26262e));
         g.fillRoundedRectangle (maqamCycleRect, 5.0f);
         g.setColour (gold);
-        g.drawText (kMaqamat[proc.currentMaqamIndex].nameEn, maqamCycleRect, juce::Justification::centred);
+        g.drawText ("Scale: " + juce::String (kMaqamat[proc.currentMaqamIndex].nameEn), maqamCycleRect, juce::Justification::centred);
 
+        // زر تحديد الأوكتاف الذي يبدأ منه الخرج (Out Oct: Follow أو Lock Oct 1..5)
+        startOctaveRect = { 326.0f, 414.0f, 175.0f, 25.0f };
+        g.setColour (proc.targetStartOctave > 0 ? pink : juce::Colour (0xff26262e));
+        g.fillRoundedRectangle (startOctaveRect, 5.0f);
+        g.setColour (bright);
+        juce::String octText = (proc.targetStartOctave == 0)
+            ? "Out Oct: Follow Voice"
+            : ("Out Oct: LOCK C" + juce::String (proc.targetStartOctave) + " (Oct " + juce::String (proc.targetStartOctave) + ")");
+        g.drawText (octText, startOctaveRect, juce::Justification::centred);
+
+        // أزرار النقل بالسيميتون (-12 .. +12 ST)
+        semiMinusRect = { 510.0f, 414.0f, 34.0f, 25.0f };
+        semiDisplayRect = { 548.0f, 414.0f, 118.0f, 25.0f };
+        semiPlusRect = { 670.0f, 414.0f, 34.0f, 25.0f };
+
+        g.setColour (juce::Colour (0xff26262e));
+        g.fillRoundedRectangle (semiMinusRect, 5.0f);
+        g.fillRoundedRectangle (semiDisplayRect, 5.0f);
+        g.fillRoundedRectangle (semiPlusRect, 5.0f);
+        g.setColour (gold);
+        g.drawText ("-", semiMinusRect, juce::Justification::centred);
+        g.drawText ("Transpose: " + juce::String (proc.semitoneTranspose > 0 ? "+" : "") + juce::String (proc.semitoneTranspose) + " ST", semiDisplayRect, juce::Justification::centred);
+        g.drawText ("+", semiPlusRect, juce::Justification::centred);
+
+        // عجلتي Pitch و Mod
         g.setColour (juce::Colour (0xff151519));
         g.fillRoundedRectangle (38.0f, 446.0f, 24.0f, 102.0f, 5.0f);
         g.fillRoundedRectangle (70.0f, 446.0f, 24.0f, 102.0f, 5.0f);
-
         float pbNorm = (float) proc.currentPitchBendValue.load() / 16383.0f;
-        float pbY = 446.0f + (1.0f - pbNorm) * 86.0f;
         g.setColour (pink);
-        g.fillRoundedRectangle (40.0f, pbY, 20.0f, 14.0f, 3.0f);
-
-        float modY = 446.0f + (1.0f - proc.vowelEnv) * 86.0f;
+        g.fillRoundedRectangle (40.0f, 446.0f + (1.0f - pbNorm) * 86.0f, 20.0f, 14.0f, 3.0f);
         g.setColour (gold);
-        g.fillRoundedRectangle (72.0f, modY, 20.0f, 14.0f, 3.0f);
+        g.fillRoundedRectangle (72.0f, 446.0f + (1.0f - proc.vowelEnv) * 86.0f, 20.0f, 14.0f, 3.0f);
 
+        // البيانو المتدرج (36 مفتاحاً)
         const float kbX = 114.0f, kbY = 446.0f, kbW = 830.0f, kbH = 102.0f;
         const int numKeys = 36;
         const float keyW = kbW / (float) numKeys;
@@ -1132,222 +1290,184 @@ public:
 
         for (int k = 0; k < numKeys; ++k)
         {
-            int midi = 48 + k;
-            int pc = midi % 12;
-            int state = proc.noteStates[pc];
-            bool isPlaying = (midi == activeMidi);
-
+            int midi = 48 + k, pc = midi % 12, state = proc.noteStates[pc];
             juce::Rectangle<float> kr (kbX + k * keyW, kbY, keyW - 1.5f, kbH);
             pianoKeyRects[k] = kr;
 
-            if (isPlaying)
-                g.setColour (bright);
-            else if (state == 2)
-                g.setColour (gold);
-            else if (state == 1)
-                g.setColour (pink.interpolatedWith (gold, (float) k / (float) numKeys * 0.45f));
-            else
-                g.setColour (juce::Colour (0xff232329));
-
+            g.setColour (midi == activeMidi ? bright : (state == 2 ? gold : (state == 1 ? pink.interpolatedWith (gold, (float) k / 36.0f * 0.45f) : juce::Colour (0xff232329))));
             g.fillRoundedRectangle (kr, 3.0f);
-
-            if (state == 2)
-            {
-                g.setColour (juce::Colours::black);
-                g.setFont (juce::Font (9.0f, juce::Font::bold));
-                g.drawText ("1/2b", kr.removeFromBottom (20.0f), juce::Justification::centred);
-            }
         }
+
+        // الشريط السفلي
+        bottomDirectMidiRect = { 38.0f, 560.0f, 290.0f, 28.0f };
+        g.setColour (juce::Colour (0xff1f3328));
+        g.fillRoundedRectangle (bottomDirectMidiRect, 5.0f);
+        g.setColour (green);
+        g.drawText ("HW MIDI: " + proc.directMidiDeviceName, bottomDirectMidiRect, juce::Justification::centred);
 
         synthCycleRect = { 340.0f, 560.0f, 195.0f, 28.0f };
         g.setColour (juce::Colour (0xff25252c));
         g.fillRoundedRectangle (synthCycleRect, 5.0f);
         g.setColour (gold);
-        const char* synthNames[6] = { "Synth: Electric Saz", "Synth: G-Clarinet", "Synth: Electric Oud",
-                                      "Synth: Kawala", "Synth: Mizmar", "Synth: Sub Bass" };
-        g.drawText (synthNames[proc.synthPresetIndex % 6], synthCycleRect, juce::Justification::centred);
+        const char* synthNames[4] = { "Synth: Electric Saz", "Synth: G-Clarinet", "Synth: Electric Oud", "Synth: Sub Bass" };
+        g.drawText (synthNames[proc.synthPresetIndex % 4], synthCycleRect, juce::Justification::centred);
 
-        intellMuteRect = { 555.0f, 560.0f, 130.0f, 28.0f };
+        intellMuteRect = { 555.0f, 560.0f, 145.0f, 28.0f };
         bool intMuted = proc.intellAudioMuted.load();
         g.setColour (intMuted ? pink : juce::Colour (0xff2b3a30));
         g.fillRoundedRectangle (intellMuteRect, 5.0f);
         g.setColour (bright);
         g.drawText (intMuted ? "Intell Audio: MUTED" : "Intell Audio: ON", intellMuteRect, juce::Justification::centred);
 
-        trigMuteRect = { 695.0f, 560.0f, 125.0f, 28.0f };
+        trigMuteRect = { 710.0f, 560.0f, 145.0f, 28.0f };
         bool trMuted = proc.trigAudioMuted.load();
         g.setColour (trMuted ? pink : juce::Colour (0xff2b3a30));
         g.fillRoundedRectangle (trigMuteRect, 5.0f);
         g.setColour (bright);
         g.drawText (trMuted ? "Trig Audio: MUTED" : "Trig Audio: ON", trigMuteRect, juce::Justification::centred);
-
-        g.setColour (gold);
-        g.setFont (juce::Font (12.0f, juce::Font::bold));
-        g.drawText ("MIDI OUT: ACTIVE", 830, 560, 118, 28, juce::Justification::centred);
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
         juce::Point<float> pt = e.position;
 
-        if (taqsimButtonRect.contains (pt))
+        if (bottomDirectMidiRect.contains (pt) || (currentTab == 4 && directMidiBtnRect.contains (pt)))
         {
-            taqsimAutoPlaying = ! taqsimAutoPlaying;
-            if (! taqsimAutoPlaying) proc.guiManualMidiNote.store (-1);
-            repaint();
-            return;
+            proc.cycleDirectMidiDevice(); repaint(); return;
         }
+
+        for (int m = 0; m < 3; ++m)
+            if (exclusiveModeRects[m].contains (pt)) { proc.setExclusiveEngineMode (m); repaint(); return; }
+
+        if (midiRecButtonRect.contains (pt))
+        {
+            if (proc.isCapturingMidi.load()) proc.stopMidiCapture();
+            else proc.startMidiCapture();
+            repaint(); return;
+        }
+        if (midiClearButtonRect.contains (pt)) { proc.clearMidiCapture(); repaint(); return; }
 
         for (int i = 0; i < 5; ++i)
         {
             if (tabRects[i].contains (pt))
             {
                 currentTab = i;
-                repaint();
-                return;
+                if      (i == 1) proc.setExclusiveEngineMode (ModeTriggersOnly);
+                else if (i == 2) proc.setExclusiveEngineMode (ModeMelodyOnly);
+                else if (i == 3) proc.setExclusiveEngineMode (ModeChordsOnly);
+                repaint(); return;
             }
         }
 
-        if (intellMuteRect.contains (pt))
-        {
-            proc.intellAudioMuted.store (! proc.intellAudioMuted.load());
-            repaint();
-            return;
-        }
+        if (rootCycleRect.contains (pt))   { proc.applyMaqamPreset ((proc.rootNote + 1) % 12, proc.currentMaqamIndex); repaint(); return; }
+        if (maqamCycleRect.contains (pt))  { proc.applyMaqamPreset (proc.rootNote, (proc.currentMaqamIndex + 1) % (int) kMaqamat.size()); repaint(); return; }
+        if (startOctaveRect.contains (pt)) { proc.targetStartOctave = (proc.targetStartOctave + 1) % 6; repaint(); return; }
+        if (semiMinusRect.contains (pt))   { proc.semitoneTranspose = juce::jlimit (-24, 24, proc.semitoneTranspose - 1); repaint(); return; }
+        if (semiPlusRect.contains (pt))    { proc.semitoneTranspose = juce::jlimit (-24, 24, proc.semitoneTranspose + 1); repaint(); return; }
+        if (semiDisplayRect.contains (pt)) { proc.semitoneTranspose = 0; repaint(); return; }
 
-        if (trigMuteRect.contains (pt))
-        {
-            proc.trigAudioMuted.store (! proc.trigAudioMuted.load());
-            repaint();
-            return;
-        }
-
-        if (synthCycleRect.contains (pt))
-        {
-            proc.synthPresetIndex = (proc.synthPresetIndex + 1) % 6;
-            repaint();
-            return;
-        }
-
-        if (rootCycleRect.contains (pt))
-        {
-            proc.applyMaqamPreset ((proc.rootNote + 1) % 12, proc.currentMaqamIndex);
-            repaint();
-            return;
-        }
-
-        if (maqamCycleRect.contains (pt))
-        {
-            proc.applyMaqamPreset (proc.rootNote, (proc.currentMaqamIndex + 1) % (int) kMaqamat.size());
-            repaint();
-            return;
-        }
+        if (intellMuteRect.contains (pt))  { proc.intellAudioMuted.store (! proc.intellAudioMuted.load()); repaint(); return; }
+        if (trigMuteRect.contains (pt))    { proc.trigAudioMuted.store (! proc.trigAudioMuted.load()); repaint(); return; }
+        if (synthCycleRect.contains (pt))  { proc.synthPresetIndex = (proc.synthPresetIndex + 1) % 4; repaint(); return; }
 
         for (int k = 0; k < 36; ++k)
-        {
-            if (pianoKeyRects[k].contains (pt))
-            {
-                proc.guiManualMidiNote.store (48 + k);
-                repaint();
-                return;
-            }
-        }
+            if (pianoKeyRects[k].contains (pt)) { proc.setExclusiveEngineMode (ModeMelodyOnly); proc.guiManualMidiNote.store (48 + k); repaint(); return; }
 
         if (currentTab == 0)
         {
             for (int i = 0; i < 8; ++i)
             {
                 if (padLoadRects[i].contains (pt)) { openSampleChooserForPad (i); return; }
-                if (padMuteRects[i].contains (pt)) { proc.pads[i].muted = ! proc.pads[i].muted; repaint(); return; }
-                if (padBounds[i].contains (pt))    { proc.triggerPadNow (i); repaint(); return; }
+                if (padBounds[i].contains (pt))    { proc.setExclusiveEngineMode (ModeTriggersOnly); proc.triggerPadNow (i); repaint(); return; }
             }
-
             if (stickinessSliderRect.contains (pt))
             {
                 proc.stickiness = juce::jlimit (0.0f, 1.0f, (pt.x - stickinessSliderRect.getX()) / stickinessSliderRect.getWidth());
-                repaint();
-                return;
+                repaint(); return;
             }
-
             for (int i = 0; i < 12; ++i)
             {
                 if (wheelSegmentCenters[i].getDistanceFrom (pt) < 24.0f)
                 {
-                    if (e.mods.isRightButtonDown() || e.mods.isShiftDown())
-                        proc.noteStates[i] = (proc.noteStates[i] + 1) % 3;
-                    else
-                        proc.guiManualMidiNote.store (60 + i);
-                    repaint();
-                    return;
+                    proc.setExclusiveEngineMode (ModeMelodyOnly);
+                    if (e.mods.isRightButtonDown() || e.mods.isShiftDown()) proc.noteStates[i] = (proc.noteStates[i] + 1) % 3;
+                    else proc.guiManualMidiNote.store (60 + i);
+                    repaint(); return;
                 }
             }
         }
-        else if (currentTab == 1)
+        else if (currentTab == 1) // TRAIN
         {
             for (int i = 0; i < 8; ++i)
                 if (padBounds[i].contains (pt)) { selectedTrainPad = i; repaint(); return; }
 
-            if (trainLoadButtonRect.contains (pt))   { openSampleChooserForPad (selectedTrainPad); return; }
-            if (trainPlayButtonRect.contains (pt))   { proc.triggerPadNow (selectedTrainPad); return; }
-            if (trainRevertButtonRect.contains (pt)) { proc.revertPadToBuiltIn (selectedTrainPad); repaint(); return; }
+            if (trainVoiceBtnRect.contains (pt))   { proc.startVoiceTrainingForPad (selectedTrainPad); repaint(); return; }
+            if (trainLoadButtonRect.contains (pt)) { openSampleChooserForPad (selectedTrainPad); return; }
+            if (trainPlayButtonRect.contains (pt)) { proc.triggerPadNow (selectedTrainPad); return; }
+            if (trainRevertButtonRect.contains (pt))
+            {
+                proc.clearPadSample (selectedTrainPad);
+                proc.clearVoiceTrainingForPad (selectedTrainPad);
+                repaint(); return;
+            }
         }
-        else if (currentTab == 2)
+        else if (currentTab == 2) // KEY
         {
-            for (int m = 0; m < 8; ++m)
+            for (int m = 0; m < 10; ++m)
                 if (maqamPresetRects[m].contains (pt)) { proc.applyMaqamPreset (proc.rootNote, m); repaint(); return; }
 
             if (qtDepthSliderRect.contains (pt))
             {
                 float norm = juce::jlimit (0.0f, 1.0f, (pt.x - qtDepthSliderRect.getX()) / qtDepthSliderRect.getWidth());
                 proc.quarterToneCents = -65.0f + norm * 30.0f;
-                repaint();
-                return;
+                repaint(); return;
             }
-
             for (int i = 0; i < 12; ++i)
                 if (wheelSegmentCenters[i].getDistanceFrom (pt) < 24.0f)
                 {
                     proc.noteStates[i] = (proc.noteStates[i] + 1) % 3;
-                    repaint();
-                    return;
+                    repaint(); return;
                 }
         }
-        else if (currentTab == 3)
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (! isDraggingMidi && midiDragButtonRect.contains (e.mouseDownPosition) && e.getDistanceFromDragStart() > 4)
         {
-            if (chordsToggleRect.contains (pt)) { proc.chordsEnabled = ! proc.chordsEnabled; repaint(); return; }
-        }
-        else if (currentTab == 4)
-        {
-            if (bendModeRect.contains (pt)) { proc.truBendMode = ! proc.truBendMode; repaint(); return; }
+            isDraggingMidi = true;
+            proc.stopMidiCapture();
+            juce::File midiFile = proc.exportCapturedMidiToTempFile();
+            juce::DragAndDropContainer::performExternalDragDropOfFiles ({ midiFile.getFullPathName() }, false, this, [this]() { isDraggingMidi = false; });
         }
     }
 
     void mouseUp (const juce::MouseEvent&) override
     {
-        if (! taqsimAutoPlaying)
-            proc.guiManualMidiNote.store (-1);
+        isDraggingMidi = false;
+        proc.guiManualMidiNote.store (-1);
     }
 
 private:
     VoxN2AudioProcessor& proc;
     int currentTab = 0;
     int selectedTrainPad = 0;
-    bool taqsimAutoPlaying = false;
-    int taqsimStepCounter = 0;
+    bool isDraggingMidi = false;
 
+    std::array<juce::Rectangle<float>, 3> exclusiveModeRects;
     std::array<juce::Rectangle<float>, 5> tabRects;
     std::array<juce::Rectangle<float>, 8> padBounds;
     std::array<juce::Rectangle<float>, 8> padLoadRects;
-    std::array<juce::Rectangle<float>, 8> padMuteRects;
     std::array<juce::Point<float>, 12> wheelSegmentCenters;
-    std::array<juce::Rectangle<float>, 4> vowelRects;
-    std::array<juce::Rectangle<float>, 8> maqamPresetRects;
+    std::array<juce::Rectangle<float>, 10> maqamPresetRects;
     std::array<juce::Rectangle<float>, 36> pianoKeyRects;
 
-    juce::Rectangle<float> taqsimButtonRect, stickinessSliderRect, qtDepthSliderRect;
-    juce::Rectangle<float> trainLoadButtonRect, trainPlayButtonRect, trainRevertButtonRect;
-    juce::Rectangle<float> chordsToggleRect, bendModeRect;
-    juce::Rectangle<float> rootCycleRect, maqamCycleRect, synthCycleRect, intellMuteRect, trigMuteRect;
+    juce::Rectangle<float> midiRecButtonRect, midiDragButtonRect, midiClearButtonRect;
+    juce::Rectangle<float> stickinessSliderRect, qtDepthSliderRect;
+    juce::Rectangle<float> trainVoiceBtnRect, trainLoadButtonRect, trainPlayButtonRect, trainRevertButtonRect;
+    juce::Rectangle<float> directMidiBtnRect, bottomDirectMidiRect;
+    juce::Rectangle<float> rootCycleRect, maqamCycleRect, startOctaveRect, semiMinusRect, semiDisplayRect, semiPlusRect;
+    juce::Rectangle<float> synthCycleRect, intellMuteRect, trigMuteRect;
 
     std::unique_ptr<juce::FileChooser> fileChooser;
 
