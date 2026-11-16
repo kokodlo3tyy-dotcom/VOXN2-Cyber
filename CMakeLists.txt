@@ -16,10 +16,8 @@ juce_add_plugin(VOXN2CyberGold
     COPY_PLUGIN_AFTER_BUILD FALSE
     PLUGIN_MANUFACTURER_CODE Voxn
     PLUGIN_CODE Vxn2
-    FORMATS VST3 Standalone
+    FORMATS VST3
     PRODUCT_NAME "VOXN 2 Cyber Gold"
-    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Assets/VoxN2Icon.png"
-    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/VoxN2Icon.png"
 )
 
 target_sources(VOXN2CyberGold
