@@ -125,9 +125,6 @@ public:
         return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
     }
 
-    // ==========================================================================
-    // محرك التعرف التلقائي على درجة الركوز والمقام (Auto Key & Scale Detection)
-    // ==========================================================================
     void toggleAutoKeyDetection()
     {
         if (isDetectingKey.load())
@@ -158,7 +155,6 @@ public:
             return;
         }
 
-        // إعطاء وزن إضافي لآخر نغمة استقرت عليها الجملة (قرار الركوز / Tonic Cadence)
         if (lastDetectedPitchClass >= 0 && lastDetectedPitchClass < 12)
             pitchClassWeights[lastDetectedPitchClass] *= 1.38f;
 
@@ -170,8 +166,7 @@ public:
         {
             for (int m = 0; m < (int) kMaqamat.size(); ++m)
             {
-                // منح أولوية خفيفة للمقامات الأساسية الشائعة عند تساوي النقاط
-                float score = pitchClassWeights[r] * 1.45f; // درجة الركوز
+                float score = pitchClassWeights[r] * 1.45f;
 
                 for (int step = 0; step < 12; ++step)
                 {
@@ -180,23 +175,11 @@ public:
                     float w = pitchClassWeights[pc];
                     float qtW = quarterToneWeights[pc];
 
-                    if (rule == 1)
-                    {
-                        score += w * 1.0f - qtW * 0.5f;
-                    }
-                    else if (rule == 2)
-                    {
-                        // مكافأة عالية إذا غنى المستخدم ربع تون فعلي على هذه الدرجة
-                        score += w * 0.85f + qtW * 1.85f;
-                    }
-                    else
-                    {
-                        // خصم النغمات الخارجة عن المقام
-                        score -= w * 1.35f;
-                    }
+                    if (rule == 1) score += w * 1.0f - qtW * 0.5f;
+                    else if (rule == 2) score += w * 0.85f + qtW * 1.85f;
+                    else score -= w * 1.35f;
                 }
 
-                // تمييز Major عن Ajam والـ Minor عن Nahawand ما لم يظهر طابع شرقي
                 if (m == 9 || m == 8) score -= 0.05f;
 
                 if (score > bestScore)
@@ -212,9 +195,6 @@ public:
         autoKeyStatusText = "LOCKED: " + juce::String (kNoteNames[bestRoot]) + " " + juce::String (kMaqamat[bestMaqam].nameEn);
     }
 
-    // ==========================================================================
-    // ربط مخرج الميدي المباشر (loopMIDI)
-    // ==========================================================================
     void autoConnectDirectMidiDevice()
     {
         auto devices = juce::MidiOutput::getAvailableDevices();
@@ -290,13 +270,10 @@ public:
 
     juce::uint8 computeDynamicVelocity (float inputLevel, float floorLevel) const
     {
-        if (fixedVelocity127)
-            return 127;
-
+        if (fixedVelocity127) return 127;
         float norm = juce::jlimit (0.0f, 1.0f, (inputLevel - floorLevel) / juce::jmax (0.01f, 0.42f - floorLevel));
         float exponent = std::pow (2.2f, -velocityCurve);
         float shaped = std::pow (norm, exponent);
-
         int vMin = juce::jmin (minVelocity, maxVelocity);
         int vMax = juce::jmax (minVelocity, maxVelocity);
         int vel = vMin + (int) std::round (shaped * (float) (vMax - vMin));
@@ -378,17 +355,14 @@ public:
         double compensatedSec = juce::jmax (0.0, rawSec - 0.015);
         double ticks = compensatedSec * (bpm / 60.0) * 960.0;
 
-        if (quantizeMode == 1)
-            ticks = std::round (ticks / 480.0) * 480.0;
-        else if (quantizeMode == 2)
-            ticks = std::round (ticks / 240.0) * 240.0;
+        if (quantizeMode == 1) ticks = std::round (ticks / 480.0) * 480.0;
+        else if (quantizeMode == 2) ticks = std::round (ticks / 240.0) * 240.0;
 
         juce::MidiMessage copy (msg);
         copy.setTimeStamp (ticks);
         capturedMidiSequence.addEvent (copy);
         capturedMidiSequence.updateMatchedPairs();
-        if (msg.isNoteOn())
-            capturedNoteCount.fetch_add (1);
+        if (msg.isNoteOn()) capturedNoteCount.fetch_add (1);
     }
 
     juce::File exportCapturedMidiToFile (const juce::File& targetFile)
@@ -528,8 +502,7 @@ public:
                 if (hasP5)            opts.push_back ({ nName + " Power", { 0, 7, 12 } });
             }
 
-            if (opts.empty())
-                opts.push_back ({ nName + " Oct", { 0, 12 } });
+            if (opts.empty()) opts.push_back ({ nName + " Oct", { 0, 12 } });
 
             selectedDegreeVoicing[deg] = juce::jlimit (0, (int) opts.size() - 1, selectedDegreeVoicing[deg]);
             ++deg;
@@ -567,11 +540,7 @@ public:
                 break;
             }
         }
-        if (bestTau < 0)
-        {
-            outConfidence = 0.0f;
-            return -1.0f;
-        }
+        if (bestTau < 0) { outConfidence = 0.0f; return -1.0f; }
 
         outConfidence = 1.0f - cmnd[bestTau];
         float s0 = cmnd[bestTau - 1], s1 = cmnd[bestTau], s2 = cmnd[bestTau + 1];
@@ -621,11 +590,9 @@ public:
             }
         }
 
-        for (int ch = 0; ch < numOutChannels; ++ch)
-            buffer.clear (ch, 0, numSamples);
+        for (int ch = 0; ch < numOutChannels; ++ch) buffer.clear (ch, 0, numSamples);
 
-        if (pendingAllNotesOff.exchange (false))
-            stopActiveMelodyAndChords (midiMessages);
+        if (pendingAllNotesOff.exchange (false)) stopActiveMelodyAndChords (midiMessages);
 
         float sumSq = 0.0f, highEnergy = 0.0f, lowEnergy = 0.0f, peakAbs = 0.0f, preEmpSumSq = 0.0f;
         int zeroCrossings = 0;
@@ -680,10 +647,8 @@ public:
             }
         }
 
-        if (! globalGateIsOpen && rms > gateOpenThresh)
-            globalGateIsOpen = true;
-        else if (globalGateIsOpen && rms < gateCloseThresh)
-            globalGateIsOpen = false;
+        if (! globalGateIsOpen && rms > gateOpenThresh) globalGateIsOpen = true;
+        else if (globalGateIsOpen && rms < gateCloseThresh) globalGateIsOpen = false;
 
         float hiHatMultiplier = 1.5f + hiHatBoost * 4.5f;
         float effectiveTrigLevel = juce::jmax (rms, hfRms * hiHatMultiplier);
@@ -696,16 +661,13 @@ public:
 
         const int mode = exclusiveMode.load();
         int manualPad = pendingPadTrigger.exchange (-1);
-        if (manualPad >= 0 && manualPad < 8)
-            fireTriggerPad (manualPad, 115, midiMessages, 0);
+        if (manualPad >= 0 && manualPad < 8) fireTriggerPad (manualPad, 115, midiMessages, 0);
 
         if (mode == ModeTriggersOnly)
         {
-            if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty())
-                stopActiveMelodyAndChords (midiMessages);
+            if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty()) stopActiveMelodyAndChords (midiMessages);
 
-            if (triggerCooldownSamples > 0)
-                triggerCooldownSamples -= numSamples;
+            if (triggerCooldownSamples > 0) triggerCooldownSamples -= numSamples;
 
             float onsetDelta = effectiveTrigLevel - prevTrigLevel;
             prevTrigLevel = effectiveTrigLevel;
@@ -733,8 +695,7 @@ public:
                     tp.isVoiceTrained = true;
                     fireTriggerPad (trainIdx, dynVel, midiMessages, firstTransientOffset);
 
-                    if (tp.trainedHits >= 3)
-                        trainingPadIndex.store (-1);
+                    if (tp.trainedHits >= 3) trainingPadIndex.store (-1);
 
                     triggerCooldownSamples = (int) (currentSampleRate * 0.13);
                 }
@@ -754,11 +715,7 @@ public:
                             float padBoostFactor = 1.35f - (pads[p].padSensitivity * 0.75f);
                             float weightedDist = rawDist * padBoostFactor;
 
-                            if (weightedDist < bestScore)
-                            {
-                                bestScore = weightedDist;
-                                bestPad = p;
-                            }
+                            if (weightedDist < bestScore) { bestScore = weightedDist; bestPad = p; }
                         }
                     }
 
@@ -800,7 +757,6 @@ public:
             bool validVocalPitch = (detectedFreq > 60.0f && detectedFreq < 1050.0f)
                                    && (! condenserMode || pitchConfidence > 0.72f || manualNote >= 0);
 
-            // تغذية محرك Auto Key & Scale Detection أثناء الدندنة
             if (isDetectingKey.load())
             {
                 bool shouldFinishNow = false;
@@ -814,20 +770,16 @@ public:
                         float devCents = (rawExactMidi - (float) nearestNote) * 100.0f;
                         int pc = ((nearestNote % 12) + 12) % 12;
 
-                        // إذا انخفض الصوت بحوالي ربع تون (-65 إلى -25 سنت) نسجلها كربع تون على هذه الدرجة
-                        if (devCents < -24.0f && devCents > -68.0f)
-                            quarterToneWeights[pc] += 1.0f;
+                        if (devCents < -24.0f && devCents > -68.0f) quarterToneWeights[pc] += 1.0f;
 
                         pitchClassWeights[pc] += 1.0f;
                         lastDetectedPitchClass = pc;
                         totalDetectedVocalFrames++;
                     }
-                    // إنهاء تلقائي بعد 4.5 ثوانٍ إذا جمع نغمات كافية
                     if (autoKeySamplesElapsed >= (int) (currentSampleRate * 4.5) && totalDetectedVocalFrames >= 12)
                         shouldFinishNow = true;
                 }
-                if (shouldFinishNow)
-                    finalizeAutoKeyDetection();
+                if (shouldFinishNow) finalizeAutoKeyDetection();
             }
 
             if (validVocalPitch)
@@ -894,8 +846,7 @@ public:
             }
             else
             {
-                if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty())
-                    stopActiveMelodyAndChords (midiMessages);
+                if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty()) stopActiveMelodyAndChords (midiMessages);
             }
         }
 
@@ -976,8 +927,7 @@ public:
         auto& pad = pads[padIdx];
         pad.flashAlpha = 1.0f;
         lastPadGain[padIdx] = (float) velocity / 127.0f * 0.75f;
-        if (pad.hasCustomSample)
-            pad.playhead = 0;
+        if (pad.hasCustomSample) pad.playhead = 0;
 
         emitMidiEvent (juce::MidiMessage::noteOn  (triggersMidiChannel, pad.midiNote, velocity), midiMessages, sampleOffset);
         emitMidiEvent (juce::MidiMessage::noteOff (triggersMidiChannel, pad.midiNote), midiMessages, juce::jmin (sampleOffset + 64, 127));
@@ -991,11 +941,7 @@ public:
         int foundDeg = 0;
         for (int d = 0; d < 7; ++d)
         {
-            if (degreePitchClasses[d] == pc)
-            {
-                foundDeg = d;
-                break;
-            }
+            if (degreePitchClasses[d] == pc) { foundDeg = d; break; }
         }
 
         const auto& opts = degreeChordOptions[foundDeg];
@@ -1119,7 +1065,6 @@ public:
     bool condenserMode = true;
     std::atomic<bool> isCalibratingRoom { false };
 
-    // Auto Key Detection state
     std::atomic<bool> isDetectingKey { false };
     juce::String autoKeyStatusText { "AUTO KEY" };
 
@@ -1191,7 +1136,7 @@ private:
 };
 
 // ==============================================================================
-// الواجهة الرسومية الكلاسيكية + الشعار الذهبي #2 + زرار AUTO KEY
+// الواجهة الرسومية الأصلية الكلاسيكية + الشعار الذهبي #2 + زرار AUTO KEY
 // ==============================================================================
 class VoxN2AudioProcessorEditor : public juce::AudioProcessorEditor,
                                   public juce::Timer,
@@ -1625,14 +1570,10 @@ public:
                                 padSensSliderRect.getWidth() * currPad.padSensitivity, 14.0f, 7.0f);
     }
 
-    // ==========================================================================
-    // نافذة KEY: تضم زر AUTO KEY DETECT للتعرف التلقائي من الدندنة
-    // ==========================================================================
     void drawKeyTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
     {
         drawPitchRadarWheel (g, 200.0f, 212.0f, 108.0f, gold, pink, bright);
 
-        // زرار Auto Key Detection أسفل العجلة مباشرة
         bool detecting = proc.isDetectingKey.load();
         keyTabAutoDetectRect = { 58.0f, 334.0f, 284.0f, 36.0f };
         g.setColour (detecting ? pink : green);
@@ -1712,8 +1653,7 @@ public:
                 g.setFont (juce::Font (11.5f, isSel ? juce::Font::bold : juce::Font::plain));
                 g.drawText (opts[v].label, btn, juce::Justification::centred);
             }
-            for (int v = maxShow; v < 6; ++v)
-                chordOptionRects[deg][v] = {};
+            for (int v = maxShow; v < 6; ++v) chordOptionRects[deg][v] = {};
         }
     }
 
@@ -1767,9 +1707,6 @@ public:
                     48, 266, 860, 22, juce::Justification::centredLeft);
     }
 
-    // ==========================================================================
-    // القسم السفلي: يضم زرار AUTO KEY سريع الوصول بجانب Key و Scale و Range
-    // ==========================================================================
     void drawBottomSection (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright)
     {
         bool detecting = proc.isDetectingKey.load();
