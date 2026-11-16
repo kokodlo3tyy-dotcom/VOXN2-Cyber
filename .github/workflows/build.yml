@@ -27,30 +27,31 @@ jobs:
           $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
           $g.Clear([System.Drawing.Color]::FromArgb(255, 20, 20, 24))
 
-          $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 229, 184, 75), 10)
+          $goldColor = [System.Drawing.Color]::FromArgb(255, 229, 184, 75)
+          $borderPen = New-Object System.Drawing.Pen($goldColor, 10)
           $g.DrawRectangle($borderPen, 12, 12, 232, 232)
 
-          $logoPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 229, 184, 75), 18)
+          $logoPen = New-Object System.Drawing.Pen($goldColor, 18)
           $logoPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
           $logoPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
           $logoPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Miter
 
-          $pts = @(
-            [System.Drawing.Point]::new(34, 56),
-            [System.Drawing.Point]::new(86, 202),
-            [System.Drawing.Point]::new(124, 96),
-            [System.Drawing.Point]::new(144, 158),
-            [System.Drawing.Point]::new(168, 66),
-            [System.Drawing.Point]::new(224, 66)
+          [System.Drawing.Point[]]$pts = @(
+            (New-Object System.Drawing.Point(34, 56)),
+            (New-Object System.Drawing.Point(86, 202)),
+            (New-Object System.Drawing.Point(124, 96)),
+            (New-Object System.Drawing.Point(144, 158)),
+            (New-Object System.Drawing.Point(168, 66)),
+            (New-Object System.Drawing.Point(224, 66))
           )
           $g.DrawLines($logoPen, $pts)
 
-          $gPts = @(
-            [System.Drawing.Point]::new(168, 66),
-            [System.Drawing.Point]::new(152, 196),
-            [System.Drawing.Point]::new(222, 196),
-            [System.Drawing.Point]::new(222, 134),
-            [System.Drawing.Point]::new(186, 134)
+          [System.Drawing.Point[]]$gPts = @(
+            (New-Object System.Drawing.Point(168, 66)),
+            (New-Object System.Drawing.Point(152, 196)),
+            (New-Object System.Drawing.Point(222, 196)),
+            (New-Object System.Drawing.Point(222, 134)),
+            (New-Object System.Drawing.Point(186, 134))
           )
           $g.DrawLines($logoPen, $gPts)
 
