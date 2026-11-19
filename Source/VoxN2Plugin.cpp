@@ -3,6 +3,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_dsp/juce_dsp.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <cmath>
@@ -14,6 +15,13 @@ enum EngineExclusiveMode
     ModeMelodyOnly   = 0,
     ModeTriggersOnly = 1,
     ModeChordsOnly   = 2
+};
+
+enum MelodyVoiceMode
+{
+    VoiceMono   = 0,
+    VoiceLegato = 1,
+    VoicePoly   = 2
 };
 
 enum VocalRangePreset
@@ -52,6 +60,12 @@ struct ChordVoicingOption
 {
     juce::String label;
     std::vector<int> offsets;
+};
+
+struct PolyVoice
+{
+    int note = -1;
+    int samplesRemaining = 0;
 };
 
 struct TriggerPadData
@@ -105,11 +119,33 @@ public:
         currentSampleRate = (sampleRate > 0.0) ? sampleRate : 44100.0;
         yinBuffer.assign (kYinWindowSize, 0.0f);
         yinWritePos = 0;
+        samplesSinceLastYin = 0;
+        lastDetectedFreq = -1.0f;
+        lastPitchConfidence = 0.0f;
+
         synthPhase = 0.0;
+        currentSynthFreq = 261.63;
+        hadPreviousSynthNote = false;
+
         lpFilterState = 0.0f;
         hpCondenserState = 0.0f;
         prevSampleRaw = 0.0f;
         prevSamplePreEmp = 0.0f;
+
+        pitchHpState = 0.0f;
+        pitchPrevRaw = 0.0f;
+        pitchLp1 = 0.0f;
+        pitchLp2 = 0.0f;
+        pitchLpAlpha = (float) (1.0 - std::exp (-juce::MathConstants<double>::twoPi * 1100.0 / currentSampleRate));
+        pitchHpCoeff = (float) std::exp (-juce::MathConstants<double>::twoPi * 75.0 / currentSampleRate);
+
+        pendingLegatoOffNote = -1;
+        legatoOffSamplesRemaining = 0;
+        polyMelodyVoices.clear();
+        pendingCandidateMidi = -1;
+        pendingCandidateSamples = 0;
+        releaseHoldSamplesRemaining = 0;
+        pendingGlideCCUpdate.store (true);
     }
 
     void releaseResources() override {}
@@ -183,7 +219,7 @@ public:
 
     void emitMidiEvent (const juce::MidiMessage& msg, juce::MidiBuffer& midiMessages, int sampleOffset = 0)
     {
-        midiMessages.addEvent (msg, sampleOffset);
+        midiMessages.addEvent (msg, juce::jmax (0, sampleOffset));
         recordMidiEventInternal (msg);
     }
 
@@ -192,6 +228,22 @@ public:
         int clamped = juce::jlimit (0, 2, newMode);
         if (exclusiveMode.exchange (clamped) != clamped)
             pendingAllNotesOff.store (true);
+    }
+
+    void setMelodyVoiceMode (int newVoiceMode)
+    {
+        int clamped = juce::jlimit (0, 2, newVoiceMode);
+        if (melodyVoiceMode.exchange (clamped) != clamped)
+        {
+            pendingAllNotesOff.store (true);
+            pendingGlideCCUpdate.store (true);
+        }
+    }
+
+    void setGlideMs (float ms)
+    {
+        glideMs = juce::jlimit (0.0f, 300.0f, ms);
+        pendingGlideCCUpdate.store (true);
     }
 
     juce::uint8 computeDynamicVelocity (float inputLevel, float floorLevel) const
@@ -241,6 +293,7 @@ public:
         captureFirstEventReceived = false;
         capturedNoteCount.store (0);
         isCapturingMidi.store (true);
+        pendingGlideCCUpdate.store (true);
     }
 
     void stopMidiCapture()
@@ -269,19 +322,22 @@ public:
     {
         if (! isCapturingMidi.load()) return;
         const juce::SpinLock::ScopedLockType sl (captureLock);
-        if (! captureFirstEventReceived)
+        if (! captureFirstEventReceived && msg.isNoteOn())
         {
             captureFirstEventReceived = true;
             capturedSamplesElapsed = 0;
         }
 
         double bpm = hostBpm.load();
-        double rawSec = (double) capturedSamplesElapsed / currentSampleRate;
+        double rawSec = captureFirstEventReceived ? ((double) capturedSamplesElapsed / currentSampleRate) : 0.0;
         double compensatedSec = juce::jmax (0.0, rawSec - 0.015);
         double ticks = compensatedSec * (bpm / 60.0) * 960.0;
 
-        if (quantizeMode == 1) ticks = std::round (ticks / 480.0) * 480.0;
-        else if (quantizeMode == 2) ticks = std::round (ticks / 240.0) * 240.0;
+        if (msg.isNoteOn() || msg.isNoteOff())
+        {
+            if (quantizeMode == 1) ticks = std::round (ticks / 480.0) * 480.0;
+            else if (quantizeMode == 2) ticks = std::round (ticks / 240.0) * 240.0;
+        }
 
         juce::MidiMessage copy (msg);
         copy.setTimeStamp (ticks);
@@ -433,27 +489,43 @@ public:
         }
     }
 
-    float detectPitchYIN (const std::vector<float>& buf, double sr, float& outConfidence)
+    float detectPitchYINDecimated (const std::vector<float>& ringBuf, int writePos, double sr, float& outConfidence)
     {
-        const int W = (int) buf.size() / 2;
-        std::vector<float> diff (W, 0.0f), cmnd (W, 0.0f);
-        for (int tau = 1; tau < W; ++tau)
+        constexpr int decLen = kYinWindowSize / 2; // 1024 samples at sr/2
+        constexpr int W      = decLen / 2;         // 512 lags -> tracks down to ~62Hz cleanly
+        const double effSr   = sr * 0.5;
+
+        std::array<float, decLen> decBuf;
+        for (int i = 0; i < decLen; ++i)
+        {
+            int idx0 = (writePos + i * 2) % kYinWindowSize;
+            int idx1 = (idx0 + 1) % kYinWindowSize;
+            decBuf[i] = 0.5f * (ringBuf[idx0] + ringBuf[idx1]);
+        }
+
+        const int minTau = juce::jmax (2, (int) (effSr / 1050.0));
+        const int maxTau = juce::jmin (W - 2, (int) (effSr / 62.0));
+
+        std::array<float, W> diff {};
+        std::array<float, W> cmnd {};
+        cmnd[0] = 1.0f;
+
+        float runningSum = 0.0f;
+        for (int tau = 1; tau <= maxTau + 1; ++tau)
         {
             float sum = 0.0f;
-            for (int i = 0; i < W; ++i) { float d = buf[i] - buf[i + tau]; sum += d * d; }
+            for (int i = 0; i < W; ++i)
+            {
+                float d = decBuf[i] - decBuf[i + tau];
+                sum += d * d;
+            }
             diff[tau] = sum;
+            runningSum += sum;
+            cmnd[tau] = (runningSum > 1.0e-9f) ? (sum * (float) tau / runningSum) : 1.0f;
         }
-        cmnd[0] = 1.0f;
-        float runningSum = 0.0f;
-        for (int tau = 1; tau < W; ++tau)
-        {
-            runningSum += diff[tau];
-            cmnd[tau] = (runningSum > 1.0e-9f) ? (diff[tau] * (float) tau / runningSum) : 1.0f;
-        }
-        const int minTau = juce::jmax (2, (int) (sr / 1050.0));
-        const int maxTau = juce::jmin (W - 2, (int) (sr / 65.0));
+
         int bestTau = -1;
-        float threshold = condenserMode ? 0.12f : 0.16f;
+        float threshold = condenserMode ? 0.16f : 0.19f;
 
         for (int tau = minTau; tau < maxTau; ++tau)
         {
@@ -464,21 +536,29 @@ public:
                 break;
             }
         }
-        if (bestTau < 0) { outConfidence = 0.0f; return -1.0f; }
+
+        if (bestTau < 0)
+        {
+            outConfidence = 0.0f;
+            return -1.0f;
+        }
 
         outConfidence = 1.0f - cmnd[bestTau];
         float s0 = cmnd[bestTau - 1], s1 = cmnd[bestTau], s2 = cmnd[bestTau + 1];
         float denom = 2.0f * (2.0f * s1 - s2 - s0);
         float betterTau = (float) bestTau + ((std::abs (denom) > 1e-6f) ? (s2 - s0) / denom : 0.0f);
-        return (betterTau > 0.0f) ? (float) (sr / betterTau) : -1.0f;
+        return (betterTau > 0.0f) ? (float) (effSr / betterTau) : -1.0f;
     }
 
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override
     {
         juce::ScopedNoDenormals noDenormals;
         const int numSamples = buffer.getNumSamples();
+        if (numSamples <= 0) return;
+
         const int numInChannels = getTotalNumInputChannels();
         const int numOutChannels = getTotalNumOutputChannels();
+        const int maxSampleIdx = juce::jmax (0, numSamples - 1);
 
         if (auto* ph = getPlayHead())
         {
@@ -493,6 +573,46 @@ public:
         midiMessages.clear();
         if (isCapturingMidi.load() && captureFirstEventReceived)
             capturedSamplesElapsed += numSamples;
+
+        if (pendingGlideCCUpdate.exchange (false))
+        {
+            bool glideOn = (glideMs > 1.0f);
+            int cc5Val = juce::jlimit (0, 127, (int) std::round ((glideMs / 300.0f) * 127.0f));
+            emitMidiEvent (juce::MidiMessage::controllerEvent (pitchMidiChannel, 65, glideOn ? 127 : 0), midiMessages, 0);
+            emitMidiEvent (juce::MidiMessage::controllerEvent (pitchMidiChannel, 5, cc5Val), midiMessages, 0);
+        }
+
+        // Tick down delayed Legato Note-Off
+        if (pendingLegatoOffNote >= 0)
+        {
+            legatoOffSamplesRemaining -= numSamples;
+            if (legatoOffSamplesRemaining <= 0)
+            {
+                if (pendingLegatoOffNote != activeOutputMidiNote)
+                    emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, pendingLegatoOffNote), midiMessages, 0);
+                pendingLegatoOffNote = -1;
+                legatoOffSamplesRemaining = 0;
+            }
+        }
+
+        // Tick down Poly Melody overlapping voices
+        if (! polyMelodyVoices.empty())
+        {
+            for (auto it = polyMelodyVoices.begin(); it != polyMelodyVoices.end(); )
+            {
+                it->samplesRemaining -= numSamples;
+                if (it->samplesRemaining <= 0)
+                {
+                    if (it->note != activeOutputMidiNote)
+                        emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, it->note), midiMessages, 0);
+                    it = polyMelodyVoices.erase (it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
 
         std::vector<float> micMono (numSamples, 0.0f);
         if (numInChannels > 0)
@@ -511,6 +631,15 @@ public:
                 {
                     micMono[i] = raw;
                 }
+
+                // Dedicated Band-Pass (75Hz - 1100Hz) for clean pitch tracking (kills sibilance & high harmonics)
+                pitchHpState = pitchHpCoeff * (pitchHpState + raw - pitchPrevRaw);
+                pitchPrevRaw = raw;
+                pitchLp1 += pitchLpAlpha * (pitchHpState - pitchLp1);
+                pitchLp2 += pitchLpAlpha * (pitchLp1 - pitchLp2);
+
+                yinBuffer[yinWritePos] = pitchLp2;
+                yinWritePos = (yinWritePos + 1) % kYinWindowSize;
             }
         }
 
@@ -550,9 +679,6 @@ public:
 
             if (i > 0 && ((micMono[i - 1] >= 0.0f && s < 0.0f) || (micMono[i - 1] < 0.0f && s >= 0.0f)))
                 ++zeroCrossings;
-
-            yinBuffer[yinWritePos] = s;
-            yinWritePos = (yinWritePos + 1) % kYinWindowSize;
         }
 
         float nSamp = (float) juce::jmax (1, numSamples);
@@ -589,7 +715,8 @@ public:
 
         if (mode == ModeTriggersOnly)
         {
-            if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty()) stopActiveMelodyAndChords (midiMessages);
+            if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty() || ! polyMelodyVoices.empty())
+                stopActiveMelodyAndChords (midiMessages);
 
             if (triggerCooldownSamples > 0) triggerCooldownSamples -= numSamples;
 
@@ -607,6 +734,7 @@ public:
             if (onsetDelta > baseThresh && effectiveTrigLevel > minGateFloor && triggerCooldownSamples <= 0)
             {
                 juce::uint8 dynVel = computeDynamicVelocity (effectiveTrigLevel, minGateFloor);
+                int retrigLockSamples = (int) (currentSampleRate * (triggerRetrigLockMs / 1000.0f));
 
                 if (isTrainingNow)
                 {
@@ -620,8 +748,7 @@ public:
                     fireTriggerPad (trainIdx, dynVel, midiMessages, firstTransientOffset, numSamples);
 
                     if (tp.trainedHits >= 3) trainingPadIndex.store (-1);
-
-                    triggerCooldownSamples = (int) (currentSampleRate * 0.13);
+                    triggerCooldownSamples = juce::jmax (retrigLockSamples, (int) (currentSampleRate * 0.13));
                 }
                 else
                 {
@@ -647,13 +774,13 @@ public:
                     if (bestPad >= 0 && bestScore <= maxAllowedDistance)
                     {
                         fireTriggerPad (bestPad, dynVel, midiMessages, firstTransientOffset, numSamples);
-                        triggerCooldownSamples = (int) (currentSampleRate * 0.075);
+                        triggerCooldownSamples = retrigLockSamples;
                     }
                     else if (bestPad < 0)
                     {
                         int fallbackPad = (highRatio > 0.65f || zcr > 0.20f) ? 2 : ((highRatio > 0.28f) ? 1 : 0);
                         fireTriggerPad (fallbackPad, dynVel, midiMessages, firstTransientOffset, numSamples);
-                        triggerCooldownSamples = (int) (currentSampleRate * 0.075);
+                        triggerCooldownSamples = retrigLockSamples;
                     }
                 }
             }
@@ -669,17 +796,27 @@ public:
             if (manualNote >= 0)
             {
                 detectedFreq = 440.0f * std::pow (2.0f, (manualNote - 69.0f) / 12.0f);
+                pitchConfidence = 1.0f;
             }
             else if (globalGateIsOpen)
             {
-                std::vector<float> orderedYin (kYinWindowSize);
-                for (int i = 0; i < kYinWindowSize; ++i)
-                    orderedYin[i] = yinBuffer[(yinWritePos + i) % kYinWindowSize];
-                detectedFreq = detectPitchYIN (orderedYin, currentSampleRate, pitchConfidence);
+                samplesSinceLastYin += numSamples;
+                if (samplesSinceLastYin >= 128 || lastDetectedFreq < 0.0f)
+                {
+                    lastDetectedFreq = detectPitchYINDecimated (yinBuffer, yinWritePos, currentSampleRate, lastPitchConfidence);
+                    samplesSinceLastYin = 0;
+                }
+                detectedFreq = lastDetectedFreq;
+                pitchConfidence = lastPitchConfidence;
+            }
+            else
+            {
+                lastDetectedFreq = -1.0f;
+                lastPitchConfidence = 0.0f;
             }
 
-            bool validVocalPitch = (detectedFreq > 60.0f && detectedFreq < 1050.0f)
-                                   && (! condenserMode || pitchConfidence > 0.72f || manualNote >= 0);
+            bool validVocalPitch = (detectedFreq > 62.0f && detectedFreq < 1050.0f)
+                                   && (! condenserMode || pitchConfidence > 0.65f || manualNote >= 0);
 
             if (isDetectingKey.load())
             {
@@ -708,69 +845,197 @@ public:
 
             if (validVocalPitch)
             {
+                releaseHoldSamplesRemaining = (int) (currentSampleRate * 0.045); // 45ms smooth release hold
+
                 float rawMidi = 69.0f + 12.0f * std::log2 (detectedFreq / 440.0f);
                 rawMidi += (float) semitoneTranspose;
 
-                int candidateMidi = (int) std::round (rawMidi);
-
                 if (vocalRangePreset > RangeFollow && manualNote < 0)
                 {
-                    int minMidi = 48, maxMidi = 72;
+                    float minMidi = 48.0f, maxMidi = 72.0f;
                     switch (vocalRangePreset)
                     {
-                        case RangeBass:     minMidi = 24; maxMidi = 47; break;
-                        case RangeBaritone: minMidi = 45; maxMidi = 68; break;
-                        case RangeTenor:    minMidi = 48; maxMidi = 71; break;
-                        case RangeAlto:     minMidi = 53; maxMidi = 76; break;
-                        case RangeSoprano:  minMidi = 60; maxMidi = 84; break;
+                        case RangeBass:     minMidi = 24.0f; maxMidi = 47.0f; break;
+                        case RangeBaritone: minMidi = 45.0f; maxMidi = 68.0f; break;
+                        case RangeTenor:    minMidi = 48.0f; maxMidi = 71.0f; break;
+                        case RangeAlto:     minMidi = 53.0f; maxMidi = 76.0f; break;
+                        case RangeSoprano:  minMidi = 60.0f; maxMidi = 84.0f; break;
                         default: break;
                     }
-                    while (candidateMidi < minMidi) candidateMidi += 12;
-                    while (candidateMidi > maxMidi) candidateMidi -= 12;
+                    while (rawMidi < minMidi) rawMidi += 12.0f;
+                    while (rawMidi > maxMidi) rawMidi -= 12.0f;
                 }
 
-                candidateMidi = juce::jlimit (12, 115, candidateMidi);
+                rawMidi = juce::jlimit (12.0f, 115.0f, rawMidi);
 
-                float hysteresisWidth = 0.45f + (stickiness * 0.48f);
-                if (activeRawMidiNote >= 0 && std::abs ((float) candidateMidi - (float) activeRawMidiNote) < hysteresisWidth)
-                    candidateMidi = activeRawMidiNote;
-
-                activeRawMidiNote = candidateMidi;
-                int snappedMidi = snapToMaqamScale (activeRawMidiNote);
-                int pc = ((snappedMidi % 12) + 12) % 12;
-
-                float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
-                float maxBendCents = (float) pbRangeSemitones * 100.0f;
-                int pbValue = 8192 + (int) std::round ((targetCents / maxBendCents) * 8192.0f);
-                pbValue = juce::jlimit (0, 16383, pbValue);
-                currentPitchBendValue.store (pbValue);
-                currentCentsOffset.store ((int) std::round (targetCents));
-
-                if (snappedMidi != activeOutputMidiNote)
+                // REAL float hysteresis (Stickiness) protecting active note against vibrato/trill
+                int candidateMidi = (int) std::round (rawMidi);
+                float hysteresisWidth = 0.50f + (stickiness * 0.45f);
+                if (activeRawMidiNote >= 0 && manualNote < 0
+                    && std::abs (rawMidi - (float) activeRawMidiNote) < hysteresisWidth)
                 {
-                    stopActiveMelodyAndChords (midiMessages);
-                    juce::uint8 dynVel = (manualNote >= 0) ? 110 : computeDynamicVelocity (rms, gateOpenThresh);
-                    activeOutputMidiNote = snappedMidi;
-                    currentDetectedMidiNote.store (snappedMidi);
+                    candidateMidi = activeRawMidiNote;
+                }
+
+                int snappedMidi = snapToMaqamScale (candidateMidi);
+
+                if (snappedMidi == activeOutputMidiNote)
+                {
+                    pendingCandidateMidi = -1;
+                    pendingCandidateSamples = 0;
 
                     if (mode == ModeMelodyOnly)
                     {
+                        int pc = ((snappedMidi % 12) + 12) % 12;
+                        float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
+                        int pbValue = computePitchWheelForCents (targetCents);
+                        currentPitchBendValue.store (pbValue);
+                        currentCentsOffset.store ((int) std::round (targetCents));
                         emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, 0);
-                        emitMidiEvent (juce::MidiMessage::noteOn (pitchMidiChannel, snappedMidi, dynVel), midiMessages, 0);
-                    }
-                    else if (mode == ModeChordsOnly)
-                    {
-                        triggerSmartOrientalChord (snappedMidi, dynVel, midiMessages);
                     }
                 }
-                else if (mode == ModeMelodyOnly)
+                else
                 {
-                    emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, 0);
+                    // Stability Lock (Anti-Trill / Anti-Roll Debounce)
+                    bool shouldCommit = (manualNote >= 0);
+                    if (! shouldCommit)
+                    {
+                        float lockMs = (mode == ModeChordsOnly) ? chordLockMs : melodyNoteLockMs;
+                        int requiredSamples = (int) (currentSampleRate * (lockMs / 1000.0f));
+
+                        if (snappedMidi == pendingCandidateMidi)
+                            pendingCandidateSamples += numSamples;
+                        else
+                        {
+                            pendingCandidateMidi = snappedMidi;
+                            pendingCandidateSamples = numSamples;
+                        }
+
+                        if (pendingCandidateSamples >= requiredSamples)
+                            shouldCommit = true;
+                    }
+
+                    if (shouldCommit)
+                    {
+                        pendingCandidateMidi = -1;
+                        pendingCandidateSamples = 0;
+                        activeRawMidiNote = candidateMidi;
+
+                        int pc = ((snappedMidi % 12) + 12) % 12;
+                        float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
+                        int pbValue = computePitchWheelForCents (targetCents);
+                        currentPitchBendValue.store (pbValue);
+                        currentCentsOffset.store ((int) std::round (targetCents));
+
+                        juce::uint8 dynVel = (manualNote >= 0) ? 110 : computeDynamicVelocity (rms, gateOpenThresh);
+                        int oldNote = activeOutputMidiNote;
+
+                        if (mode == ModeMelodyOnly)
+                        {
+                            stopActiveChord (midiMessages);
+                            int vMode = melodyVoiceMode.load();
+
+                            if (vMode == VoiceMono)
+                            {
+                                flushPolyAndLegatoOffs (midiMessages);
+                                if (oldNote >= 0)
+                                    emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, oldNote), midiMessages, 0);
+
+                                int onOffset = (oldNote >= 0 && maxSampleIdx > 0) ? 1 : 0;
+                                emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, onOffset);
+                                emitMidiEvent (juce::MidiMessage::noteOn (pitchMidiChannel, snappedMidi, dynVel), midiMessages, onOffset);
+                            }
+                            else if (vMode == VoiceLegato)
+                            {
+                                flushPolyVoices (midiMessages);
+                                if (pendingLegatoOffNote >= 0 && pendingLegatoOffNote != snappedMidi)
+                                {
+                                    emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, pendingLegatoOffNote), midiMessages, 0);
+                                    pendingLegatoOffNote = -1;
+                                }
+
+                                // Send NEW Note On FIRST, then schedule OLD Note Off 15ms later for clean Legato Glide
+                                emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, 0);
+                                emitMidiEvent (juce::MidiMessage::noteOn (pitchMidiChannel, snappedMidi, dynVel), midiMessages, 0);
+
+                                if (oldNote >= 0 && oldNote != snappedMidi)
+                                {
+                                    pendingLegatoOffNote = oldNote;
+                                    legatoOffSamplesRemaining = (int) (currentSampleRate * 0.015);
+                                }
+                            }
+                            else // VoicePoly (Sustain Overlap up to 4 voices)
+                            {
+                                if (pendingLegatoOffNote >= 0)
+                                {
+                                    emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, pendingLegatoOffNote), midiMessages, 0);
+                                    pendingLegatoOffNote = -1;
+                                }
+
+                                // Move old note into sustaining poly pool
+                                if (oldNote >= 0 && oldNote != snappedMidi)
+                                {
+                                    polyMelodyVoices.push_back ({ oldNote, (int) (currentSampleRate * 0.45) });
+                                    if (polyMelodyVoices.size() > 3)
+                                    {
+                                        emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, polyMelodyVoices.front().note), midiMessages, 0);
+                                        polyMelodyVoices.erase (polyMelodyVoices.begin());
+                                    }
+                                }
+
+                                // If new note is already ringing in poly pool, cleanly retrigger it
+                                for (auto it = polyMelodyVoices.begin(); it != polyMelodyVoices.end(); )
+                                {
+                                    if (it->note == snappedMidi)
+                                    {
+                                        emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, it->note), midiMessages, 0);
+                                        it = polyMelodyVoices.erase (it);
+                                    }
+                                    else ++it;
+                                }
+
+                                int onOffset = (maxSampleIdx > 0) ? 1 : 0;
+                                emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, onOffset);
+                                emitMidiEvent (juce::MidiMessage::noteOn (pitchMidiChannel, snappedMidi, dynVel), midiMessages, onOffset);
+                            }
+
+                            activeOutputMidiNote = snappedMidi;
+                            currentDetectedMidiNote.store (snappedMidi);
+                        }
+                        else if (mode == ModeChordsOnly)
+                        {
+                            // Strict No-Retrigger if same scale degree is already active
+                            int oldPc = (oldNote >= 0) ? ((oldNote % 12) + 12) % 12 : -1;
+                            if (oldPc != pc || activeChordNotes.empty())
+                            {
+                                flushPolyAndLegatoOffs (midiMessages);
+                                if (oldNote >= 0 && activeChordNotes.empty())
+                                    emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, oldNote), midiMessages, 0);
+
+                                activeOutputMidiNote = snappedMidi;
+                                currentDetectedMidiNote.store (snappedMidi);
+                                triggerSmartOrientalChord (snappedMidi, dynVel, midiMessages);
+                            }
+                        }
+                    }
                 }
             }
             else
             {
-                if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty()) stopActiveMelodyAndChords (midiMessages);
+                pendingCandidateMidi = -1;
+                pendingCandidateSamples = 0;
+
+                if (activeOutputMidiNote >= 0 || ! activeChordNotes.empty())
+                {
+                    if (manualNote < 0 && releaseHoldSamplesRemaining > 0)
+                    {
+                        releaseHoldSamplesRemaining -= numSamples;
+                    }
+                    else
+                    {
+                        stopActiveMelodyAndChords (midiMessages);
+                    }
+                }
             }
         }
 
@@ -782,16 +1047,29 @@ public:
             int pc = ((activeOutputMidiNote % 12) + 12) % 12;
             float cents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
             double targetFreq = 440.0 * std::pow (2.0, ((double) activeOutputMidiNote - 69.0 + cents / 100.0) / 12.0);
-            double phaseInc = targetFreq / currentSampleRate;
+
+            if (! hadPreviousSynthNote || glideMs <= 1.0f)
+                currentSynthFreq = targetFreq;
+
+            hadPreviousSynthNote = true;
+            double glideCoeff = (glideMs > 1.0f)
+                ? (1.0 - std::exp (-1.0 / (currentSampleRate * ((double) glideMs / 1000.0) * 0.35)))
+                : 1.0;
 
             for (int i = 0; i < numSamples; ++i)
             {
+                currentSynthFreq += (targetFreq - currentSynthFreq) * glideCoeff;
+                double phaseInc = currentSynthFreq / currentSampleRate;
                 float s = renderInternalSynthSample (synthPhase);
                 synthPhase += phaseInc;
                 if (synthPhase >= 1.0) synthPhase -= 1.0;
                 outL[i] += s * 0.22f;
                 outR[i] += s * 0.22f;
             }
+        }
+        else if (activeOutputMidiNote < 0)
+        {
+            hadPreviousSynthNote = false;
         }
 
         if (! trigAudioMuted.load())
@@ -819,8 +1097,34 @@ public:
         }
     }
 
+    int computePitchWheelForCents (float targetCents) const
+    {
+        float maxBendCents = (float) pbRangeSemitones * 100.0f;
+        int pbValue = 8192 + (int) std::round ((targetCents / maxBendCents) * 8192.0f);
+        return juce::jlimit (0, 16383, pbValue);
+    }
+
+    void flushPolyVoices (juce::MidiBuffer& midiMessages)
+    {
+        for (const auto& pv : polyMelodyVoices)
+            emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, pv.note), midiMessages, 0);
+        polyMelodyVoices.clear();
+    }
+
+    void flushPolyAndLegatoOffs (juce::MidiBuffer& midiMessages)
+    {
+        if (pendingLegatoOffNote >= 0)
+        {
+            emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, pendingLegatoOffNote), midiMessages, 0);
+            pendingLegatoOffNote = -1;
+            legatoOffSamplesRemaining = 0;
+        }
+        flushPolyVoices (midiMessages);
+    }
+
     void stopActiveMelodyAndChords (juce::MidiBuffer& midiMessages)
     {
+        flushPolyAndLegatoOffs (midiMessages);
         if (activeOutputMidiNote >= 0)
         {
             emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, activeOutputMidiNote), midiMessages, 0);
@@ -829,6 +1133,10 @@ public:
         stopActiveChord (midiMessages);
         activeOutputMidiNote = -1;
         activeRawMidiNote = -1;
+        pendingCandidateMidi = -1;
+        pendingCandidateSamples = 0;
+        releaseHoldSamplesRemaining = 0;
+        hadPreviousSynthNote = false;
         currentDetectedMidiNote.store (-1);
         currentPitchBendValue.store (8192);
         currentCentsOffset.store (0);
@@ -943,6 +1251,12 @@ public:
         state.setProperty ("globalGateLevel", globalGateLevel, nullptr);
         state.setProperty ("condenserMode", condenserMode, nullptr);
         state.setProperty ("quantizeMode", quantizeMode, nullptr);
+        state.setProperty ("stickiness", stickiness, nullptr);
+        state.setProperty ("melodyVoiceMode", melodyVoiceMode.load(), nullptr);
+        state.setProperty ("glideMs", glideMs, nullptr);
+        state.setProperty ("melodyNoteLockMs", melodyNoteLockMs, nullptr);
+        state.setProperty ("chordLockMs", chordLockMs, nullptr);
+        state.setProperty ("triggerRetrigLockMs", triggerRetrigLockMs, nullptr);
         std::unique_ptr<juce::XmlElement> xml (state.createXml());
         copyXmlToBinary (*xml, destData);
     }
@@ -963,6 +1277,13 @@ public:
             globalGateLevel = (float) state.getProperty ("globalGateLevel", 0.16f);
             condenserMode = (bool) state.getProperty ("condenserMode", true);
             quantizeMode = (int) state.getProperty ("quantizeMode", 2);
+            stickiness = (float) state.getProperty ("stickiness", 0.65f);
+            melodyVoiceMode.store ((int) state.getProperty ("melodyVoiceMode", (int) VoiceMono));
+            glideMs = (float) state.getProperty ("glideMs", 0.0f);
+            melodyNoteLockMs = (float) state.getProperty ("melodyNoteLockMs", 28.0f);
+            chordLockMs = (float) state.getProperty ("chordLockMs", 75.0f);
+            triggerRetrigLockMs = (float) state.getProperty ("triggerRetrigLockMs", 85.0f);
+            pendingGlideCCUpdate.store (true);
             applyMaqamPreset (rootNote, currentMaqamIndex);
         }
     }
@@ -977,6 +1298,14 @@ public:
     int currentMaqamIndex = 2;
     float quarterToneCents = -50.0f;
     float stickiness = 0.65f;
+
+    // Anti-Trill / Voice / Glide Parameters
+    std::atomic<int> melodyVoiceMode { VoiceMono };
+    float glideMs = 0.0f;
+    float melodyNoteLockMs = 28.0f;
+    float chordLockMs = 75.0f;
+    float triggerRetrigLockMs = 85.0f;
+    std::atomic<bool> pendingGlideCCUpdate { true };
 
     float velocityCurve = 0.35f;
     int minVelocity = 35;
@@ -1019,17 +1348,32 @@ public:
     std::atomic<int>   pendingPadTrigger { -1 };
 
 private:
-    static constexpr int kYinWindowSize = 512;
+    static constexpr int kYinWindowSize = 2048;
     std::vector<float> yinBuffer;
     int yinWritePos = 0;
+    int samplesSinceLastYin = 0;
+    float lastDetectedFreq = -1.0f;
+    float lastPitchConfidence = 0.0f;
+
     double currentSampleRate = 44100.0;
     double synthPhase = 0.0;
+    double currentSynthFreq = 261.63;
+    bool hadPreviousSynthNote = false;
+
     float lpFilterState = 0.0f;
     float hpCondenserState = 0.0f;
     float prevSampleRaw = 0.0f;
     float prevSamplePreEmp = 0.0f;
-    bool globalGateIsOpen = false;
 
+    // Dedicated Pitch Band-Pass (75Hz - 1100Hz)
+    float pitchHpState = 0.0f;
+    float pitchPrevRaw = 0.0f;
+    float pitchLp1 = 0.0f;
+    float pitchLp2 = 0.0f;
+    float pitchLpAlpha = 0.145f;
+    float pitchHpCoeff = 0.989f;
+
+    bool globalGateIsOpen = false;
     float calibPeakRms = 0.0f;
     int calibSamplesRemaining = 0;
 
@@ -1041,6 +1385,14 @@ private:
     int autoKeySamplesElapsed = 0;
 
     int activeRawMidiNote = -1, activeOutputMidiNote = -1;
+    int pendingCandidateMidi = -1;
+    int pendingCandidateSamples = 0;
+    int releaseHoldSamplesRemaining = 0;
+
+    int pendingLegatoOffNote = -1;
+    int legatoOffSamplesRemaining = 0;
+    std::vector<PolyVoice> polyMelodyVoices;
+
     float prevTrigLevel = 0.0f;
     int triggerCooldownSamples = 0;
     std::array<float, 8> lastPadGain { 0.65f, 0.65f, 0.65f, 0.65f, 0.65f, 0.65f, 0.65f, 0.65f };
@@ -1284,21 +1636,55 @@ public:
 
         drawPitchRadarWheel (g, 485.0f, 245.0f, 118.0f, gold, pink, bright);
 
+        // Right Column: Melody Voice Mode, Glide, Note Lock, Stickiness, Velocity Curve, Room Calib
         g.setColour (muted);
-        g.setFont (juce::FontOptions (11.0f));
-        g.drawText ("Stickiness:", 655, 82, 70, 20, juce::Justification::centredLeft);
-        stickinessSliderRect = { 730.0f, 86.0f, 195.0f, 12.0f };
+        g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+        g.drawText ("Stickiness: " + juce::String ((int) (proc.stickiness * 100.0f)) + "%", 655, 80, 96, 16, juce::Justification::centredLeft);
+        stickinessSliderRect = { 754.0f, 83.0f, 171.0f, 10.0f };
         g.setColour (juce::Colour (0xff16161a));
-        g.fillRoundedRectangle (stickinessSliderRect, 6.0f);
+        g.fillRoundedRectangle (stickinessSliderRect, 5.0f);
         g.setColour (pink);
         g.fillRoundedRectangle (stickinessSliderRect.getX(), stickinessSliderRect.getY(),
-                                stickinessSliderRect.getWidth() * proc.stickiness, 12.0f, 6.0f);
+                                stickinessSliderRect.getWidth() * proc.stickiness, 10.0f, 5.0f);
+
+        const int vMode = proc.melodyVoiceMode.load();
+        const char* vNames[3] = { "MONO", "LEGATO", "POLY" };
+        for (int v = 0; v < 3; ++v)
+        {
+            voiceModeRects[v] = { 655.0f + v * 92.0f, 102.0f, 86.0f, 24.0f };
+            bool isSel = (vMode == v);
+            g.setColour (isSel ? (v == 1 ? pink : (v == 2 ? green : gold)) : juce::Colour (0xff1c1c23));
+            g.fillRoundedRectangle (voiceModeRects[v], 5.0f);
+            g.setColour (isSel ? juce::Colours::black : bright);
+            g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+            g.drawText (vNames[v], voiceModeRects[v], juce::Justification::centred);
+        }
 
         g.setColour (gold);
-        g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
-        g.drawText ("DYNAMIC VELOCITY CURVE (DRAG):", 655, 118, 270, 18, juce::Justification::centredLeft);
+        g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+        g.drawText ("Glide: " + juce::String ((int) proc.glideMs) + " ms", 655, 132, 95, 16, juce::Justification::centredLeft);
+        glideSliderRect = { 754.0f, 135.0f, 171.0f, 10.0f };
+        g.setColour (juce::Colour (0xff16161a));
+        g.fillRoundedRectangle (glideSliderRect, 5.0f);
+        g.setColour (gold);
+        g.fillRoundedRectangle (glideSliderRect.getX(), glideSliderRect.getY(),
+                                glideSliderRect.getWidth() * (proc.glideMs / 300.0f), 10.0f, 5.0f);
 
-        velocityCurveBoxRect = { 655.0f, 140.0f, 270.0f, 130.0f };
+        g.setColour (green);
+        g.drawText ("Note Lock: " + juce::String ((int) proc.melodyNoteLockMs) + " ms", 655, 154, 96, 16, juce::Justification::centredLeft);
+        melodyLockSliderRect = { 754.0f, 157.0f, 171.0f, 10.0f };
+        g.setColour (juce::Colour (0xff16161a));
+        g.fillRoundedRectangle (melodyLockSliderRect, 5.0f);
+        float lockNorm = juce::jlimit (0.0f, 1.0f, (proc.melodyNoteLockMs - 10.0f) / 80.0f);
+        g.setColour (green);
+        g.fillRoundedRectangle (melodyLockSliderRect.getX(), melodyLockSliderRect.getY(),
+                                melodyLockSliderRect.getWidth() * lockNorm, 10.0f, 5.0f);
+
+        g.setColour (gold);
+        g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+        g.drawText ("DYNAMIC VELOCITY CURVE (DRAG):", 655, 176, 270, 16, juce::Justification::centredLeft);
+
+        velocityCurveBoxRect = { 655.0f, 194.0f, 270.0f, 118.0f };
         g.setColour (juce::Colour (0xff18181d));
         g.fillRoundedRectangle (velocityCurveBoxRect, 7.0f);
         g.setColour (gold.withAlpha (0.4f));
@@ -1318,14 +1704,14 @@ public:
         g.setColour (proc.fixedVelocity127 ? pink : green);
         g.strokePath (curvePath, juce::PathStrokeType (2.6f));
 
-        fixedVelToggleRect = { 655.0f, 280.0f, 270.0f, 30.0f };
+        fixedVelToggleRect = { 655.0f, 320.0f, 270.0f, 28.0f };
         g.setColour (proc.fixedVelocity127 ? pink : juce::Colour (0xff2c2c35));
         g.fillRoundedRectangle (fixedVelToggleRect, 6.0f);
         g.setColour (bright);
         g.drawText (proc.fixedVelocity127 ? "VELOCITY: FIXED 127" : "VELOCITY: DYNAMIC (DRAG CURVE)",
                     fixedVelToggleRect, juce::Justification::centred);
 
-        playCalibBtnRect = { 655.0f, 320.0f, 270.0f, 32.0f };
+        playCalibBtnRect = { 655.0f, 356.0f, 270.0f, 30.0f };
         bool cal = proc.isCalibratingRoom.load();
         g.setColour (cal ? pink : juce::Colour (0xff1f2d28));
         g.fillRoundedRectangle (playCalibBtnRect, 6.0f);
@@ -1385,7 +1771,7 @@ public:
     {
         g.setColour (gold);
         g.setFont (juce::FontOptions (12.5f).withStyle ("Bold"));
-        g.drawText ("BEATBOX & HI-HAT TRAINER (ULTRA-SENSITIVE):", 48, 82, 760, 20, juce::Justification::centredLeft);
+        g.drawText ("BEATBOX & HI-HAT TRAINER (ANTI-ROLL RETRIG LOCK):", 48, 82, 760, 20, juce::Justification::centredLeft);
 
         for (int i = 0; i < 8; ++i)
         {
@@ -1432,10 +1818,10 @@ public:
         g.setColour (green);
         g.fillRoundedRectangle (liveMeter.getX(), liveMeter.getY(), liveMeter.getWidth() * levelNorm, 14.0f, 6.0f);
 
-        trainVoiceBtnRect     = { 590.0f, 106.0f, 330.0f, 38.0f };
-        trainLoadButtonRect   = { 590.0f, 150.0f, 160.0f, 34.0f };
-        trainPlayButtonRect   = { 760.0f, 150.0f, 160.0f, 34.0f };
-        trainRevertButtonRect = { 590.0f, 190.0f, 330.0f, 30.0f };
+        trainVoiceBtnRect     = { 590.0f, 106.0f, 330.0f, 36.0f };
+        trainLoadButtonRect   = { 590.0f, 148.0f, 160.0f, 32.0f };
+        trainPlayButtonRect   = { 760.0f, 148.0f, 160.0f, 32.0f };
+        trainRevertButtonRect = { 590.0f, 186.0f, 330.0f, 28.0f };
 
         g.setColour (isListeningNow ? green : pink);
         g.fillRoundedRectangle (trainVoiceBtnRect, 6.0f);
@@ -1460,32 +1846,42 @@ public:
         g.drawText ("CLEAR PAD SAMPLE & TRAINING", trainRevertButtonRect, juce::Justification::centred);
 
         g.setColour (gold);
-        g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
-        g.drawText ("1. Train Mic Sensitivity: " + juce::String ((int) (proc.trainSensitivity * 100.0f)) + "%", 590, 232, 220, 18, juce::Justification::centredLeft);
-        trainSensSliderRect = { 590.0f, 252.0f, 330.0f, 14.0f };
+        g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
+        g.drawText ("1. Train Mic Sensitivity: " + juce::String ((int) (proc.trainSensitivity * 100.0f)) + "%", 590, 222, 240, 16, juce::Justification::centredLeft);
+        trainSensSliderRect = { 590.0f, 240.0f, 330.0f, 12.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (trainSensSliderRect, 7.0f);
+        g.fillRoundedRectangle (trainSensSliderRect, 6.0f);
         g.setColour (pink);
         g.fillRoundedRectangle (trainSensSliderRect.getX(), trainSensSliderRect.getY(),
-                                trainSensSliderRect.getWidth() * proc.trainSensitivity, 14.0f, 7.0f);
+                                trainSensSliderRect.getWidth() * proc.trainSensitivity, 12.0f, 6.0f);
 
         g.setColour (gold);
-        g.drawText ("2. Hi-Hat / Soft Sound Boost: " + juce::String ((int) (proc.hiHatBoost * 100.0f)) + "%", 590, 276, 250, 18, juce::Justification::centredLeft);
-        hiHatBoostSliderRect = { 590.0f, 296.0f, 330.0f, 14.0f };
+        g.drawText ("2. Hi-Hat / Soft Sound Boost: " + juce::String ((int) (proc.hiHatBoost * 100.0f)) + "%", 590, 260, 260, 16, juce::Justification::centredLeft);
+        hiHatBoostSliderRect = { 590.0f, 278.0f, 330.0f, 12.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (hiHatBoostSliderRect, 7.0f);
+        g.fillRoundedRectangle (hiHatBoostSliderRect, 6.0f);
         g.setColour (green);
         g.fillRoundedRectangle (hiHatBoostSliderRect.getX(), hiHatBoostSliderRect.getY(),
-                                hiHatBoostSliderRect.getWidth() * proc.hiHatBoost, 14.0f, 7.0f);
+                                hiHatBoostSliderRect.getWidth() * proc.hiHatBoost, 12.0f, 6.0f);
 
         g.setColour (gold);
-        g.drawText ("3. This Pad Sensitivity (" + currPad.name + "): " + juce::String ((int) (currPad.padSensitivity * 100.0f)) + "%", 590, 320, 280, 18, juce::Justification::centredLeft);
-        padSensSliderRect = { 590.0f, 340.0f, 330.0f, 14.0f };
+        g.drawText ("3. This Pad Sensitivity (" + currPad.name + "): " + juce::String ((int) (currPad.padSensitivity * 100.0f)) + "%", 590, 298, 290, 16, juce::Justification::centredLeft);
+        padSensSliderRect = { 590.0f, 316.0f, 330.0f, 12.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (padSensSliderRect, 7.0f);
+        g.fillRoundedRectangle (padSensSliderRect, 6.0f);
         g.setColour (gold);
         g.fillRoundedRectangle (padSensSliderRect.getX(), padSensSliderRect.getY(),
-                                padSensSliderRect.getWidth() * currPad.padSensitivity, 14.0f, 7.0f);
+                                padSensSliderRect.getWidth() * currPad.padSensitivity, 12.0f, 6.0f);
+
+        g.setColour (pink);
+        g.drawText ("4. Retrig Lock (Anti-Double Hit): " + juce::String ((int) proc.triggerRetrigLockMs) + " ms", 590, 338, 300, 16, juce::Justification::centredLeft);
+        retrigLockSliderRect = { 590.0f, 356.0f, 330.0f, 12.0f };
+        g.setColour (juce::Colour (0xff151519));
+        g.fillRoundedRectangle (retrigLockSliderRect, 6.0f);
+        float rtNorm = juce::jlimit (0.0f, 1.0f, (proc.triggerRetrigLockMs - 40.0f) / 160.0f);
+        g.setColour (pink);
+        g.fillRoundedRectangle (retrigLockSliderRect.getX(), retrigLockSliderRect.getY(),
+                                retrigLockSliderRect.getWidth() * rtNorm, 12.0f, 6.0f);
     }
 
     void drawKeyTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
@@ -1537,7 +1933,18 @@ public:
     {
         g.setColour (gold);
         g.setFont (juce::FontOptions (13.0f).withStyle ("Bold"));
-        g.drawText ("SMART DEGREE CHORD MATRIX:", 48, 82, 720, 22, juce::Justification::centredLeft);
+        g.drawText ("SMART DEGREE CHORD MATRIX:", 48, 82, 340, 22, juce::Justification::centredLeft);
+
+        g.setColour (green);
+        g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
+        g.drawText ("Chord Lock (Anti-Roll): " + juce::String ((int) proc.chordLockMs) + " ms", 470, 82, 210, 22, juce::Justification::centredRight);
+        chordLockSliderRect = { 690.0f, 87.0f, 230.0f, 12.0f };
+        g.setColour (juce::Colour (0xff151519));
+        g.fillRoundedRectangle (chordLockSliderRect, 6.0f);
+        float clNorm = juce::jlimit (0.0f, 1.0f, (proc.chordLockMs - 35.0f) / 165.0f);
+        g.setColour (green);
+        g.fillRoundedRectangle (chordLockSliderRect.getX(), chordLockSliderRect.getY(),
+                                chordLockSliderRect.getWidth() * clNorm, 12.0f, 6.0f);
 
         const char* roman[7] = { "I", "II", "III", "IV", "V", "VI", "VII" };
 
@@ -1608,12 +2015,16 @@ public:
                                 assignGateSliderRect.getWidth() * proc.globalGateLevel, 16.0f, 8.0f);
 
         g.setColour (bright);
-        g.setFont (juce::FontOptions (12.5f));
-        g.drawText ("Host Tempo Sync: " + juce::String (proc.hostBpm.load(), 1) + " BPM   |   Zero-Wait 512 Window",
-                    48, 236, 780, 22, juce::Justification::centredLeft);
+        g.setFont (juce::FontOptions (12.0f).withStyle ("Bold"));
+        g.drawText ("Pitch Engine: 2048 Sliding Window (Band-Pass 75Hz-1100Hz) | Host: " + juce::String (proc.hostBpm.load(), 1) + " BPM",
+                    48, 236, 860, 22, juce::Justification::centredLeft);
+
         g.setColour (muted);
-        g.drawText ("FL Studio Routing: Click Gear Icon on VOXN 2 -> VST Wrapper Settings -> Set MIDI Output Port 1 -> Match Input Port 1 on your Synth.",
-                    48, 266, 860, 22, juce::Justification::centredLeft);
+        g.setFont (juce::FontOptions (11.5f));
+        g.drawText ("FL Studio Live Record: Route VOXN 2 MIDI Output Port -> loopMIDI (Output Port 10) -> Enable loopMIDI Input (Port ---).",
+                    48, 268, 880, 20, juce::Justification::centredLeft);
+        g.drawText ("Studio One / Cubase / Reaper: Insert VOXN 2 on Mic Audio Track -> Set Instrument Track MIDI Input to VOXN 2 -> Record.",
+                    48, 294, 880, 20, juce::Justification::centredLeft);
     }
 
     void drawBottomSection (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright)
@@ -1764,9 +2175,29 @@ public:
 
         if (currentTab == 0)
         {
-            if (playTrigSensRect.contains (pt))
+            if (playTrigSensRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 proc.triggerSensitivity = juce::jlimit (0.05f, 1.0f, (pt.x - playTrigSensRect.getX()) / playTrigSensRect.getWidth());
+                repaint(); return;
+            }
+            for (int v = 0; v < 3; ++v)
+            {
+                if (voiceModeRects[v].contains (pt))
+                {
+                    proc.setMelodyVoiceMode (v);
+                    repaint(); return;
+                }
+            }
+            if (glideSliderRect.expanded (0.0f, 5.0f).contains (pt))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - glideSliderRect.getX()) / glideSliderRect.getWidth());
+                proc.setGlideMs (norm * 300.0f);
+                repaint(); return;
+            }
+            if (melodyLockSliderRect.expanded (0.0f, 5.0f).contains (pt))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - melodyLockSliderRect.getX()) / melodyLockSliderRect.getWidth());
+                proc.melodyNoteLockMs = 10.0f + norm * 80.0f;
                 repaint(); return;
             }
             if (velocityCurveBoxRect.contains (pt))
@@ -1791,7 +2222,7 @@ public:
                 if (padLoadRects[i].contains (pt)) { openSampleChooserForPad (i); return; }
                 if (padBounds[i].contains (pt))    { proc.setExclusiveEngineMode (ModeTriggersOnly); proc.triggerPadNow (i); repaint(); return; }
             }
-            if (stickinessSliderRect.contains (pt))
+            if (stickinessSliderRect.expanded (0.0f, 5.0f).contains (pt))
             {
                 proc.stickiness = juce::jlimit (0.0f, 1.0f, (pt.x - stickinessSliderRect.getX()) / stickinessSliderRect.getWidth());
                 repaint(); return;
@@ -1821,19 +2252,25 @@ public:
                 proc.clearVoiceTrainingForPad (selectedTrainPad);
                 repaint(); return;
             }
-            if (trainSensSliderRect.contains (pt))
+            if (trainSensSliderRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 proc.trainSensitivity = juce::jlimit (0.05f, 1.0f, (pt.x - trainSensSliderRect.getX()) / trainSensSliderRect.getWidth());
                 repaint(); return;
             }
-            if (hiHatBoostSliderRect.contains (pt))
+            if (hiHatBoostSliderRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 proc.hiHatBoost = juce::jlimit (0.0f, 1.0f, (pt.x - hiHatBoostSliderRect.getX()) / hiHatBoostSliderRect.getWidth());
                 repaint(); return;
             }
-            if (padSensSliderRect.contains (pt))
+            if (padSensSliderRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 proc.pads[selectedTrainPad].padSensitivity = juce::jlimit (0.1f, 1.0f, (pt.x - padSensSliderRect.getX()) / padSensSliderRect.getWidth());
+                repaint(); return;
+            }
+            if (retrigLockSliderRect.expanded (0.0f, 4.0f).contains (pt))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - retrigLockSliderRect.getX()) / retrigLockSliderRect.getWidth());
+                proc.triggerRetrigLockMs = 40.0f + norm * 160.0f;
                 repaint(); return;
             }
         }
@@ -1842,7 +2279,7 @@ public:
             for (int m = 0; m < 10; ++m)
                 if (maqamPresetRects[m].contains (pt)) { proc.applyMaqamPreset (proc.rootNote, m); repaint(); return; }
 
-            if (qtDepthSliderRect.contains (pt))
+            if (qtDepthSliderRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 float norm = juce::jlimit (0.0f, 1.0f, (pt.x - qtDepthSliderRect.getX()) / qtDepthSliderRect.getWidth());
                 proc.quarterToneCents = -65.0f + norm * 30.0f;
@@ -1858,6 +2295,12 @@ public:
         }
         else if (currentTab == 3)
         {
+            if (chordLockSliderRect.expanded (0.0f, 4.0f).contains (pt))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - chordLockSliderRect.getX()) / chordLockSliderRect.getWidth());
+                proc.chordLockMs = 35.0f + norm * 165.0f;
+                repaint(); return;
+            }
             for (int deg = 0; deg < 7; ++deg)
             {
                 for (int v = 0; v < 6; ++v)
@@ -1875,7 +2318,7 @@ public:
         {
             if (condenserToggleRect.contains (pt))  { proc.condenserMode = ! proc.condenserMode; repaint(); return; }
             if (calibrateRoomBtnRect.contains (pt)) { proc.startRoomCalibration(); repaint(); return; }
-            if (assignGateSliderRect.contains (pt))
+            if (assignGateSliderRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 proc.globalGateLevel = juce::jlimit (0.02f, 0.95f, (pt.x - assignGateSliderRect.getX()) / assignGateSliderRect.getWidth());
                 repaint(); return;
@@ -1895,9 +2338,26 @@ public:
 
         if (currentTab == 0)
         {
-            if (playTrigSensRect.contains (e.mouseDownPosition))
+            if (playTrigSensRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
             {
                 proc.triggerSensitivity = juce::jlimit (0.05f, 1.0f, (pt.x - playTrigSensRect.getX()) / playTrigSensRect.getWidth());
+                repaint(); return;
+            }
+            if (stickinessSliderRect.expanded (0.0f, 5.0f).contains (e.mouseDownPosition))
+            {
+                proc.stickiness = juce::jlimit (0.0f, 1.0f, (pt.x - stickinessSliderRect.getX()) / stickinessSliderRect.getWidth());
+                repaint(); return;
+            }
+            if (glideSliderRect.expanded (0.0f, 5.0f).contains (e.mouseDownPosition))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - glideSliderRect.getX()) / glideSliderRect.getWidth());
+                proc.setGlideMs (norm * 300.0f);
+                repaint(); return;
+            }
+            if (melodyLockSliderRect.expanded (0.0f, 5.0f).contains (e.mouseDownPosition))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - melodyLockSliderRect.getX()) / melodyLockSliderRect.getWidth());
+                proc.melodyNoteLockMs = 10.0f + norm * 80.0f;
                 repaint(); return;
             }
             if (velocityCurveBoxRect.contains (e.mouseDownPosition))
@@ -1910,23 +2370,41 @@ public:
         }
         else if (currentTab == 1)
         {
-            if (trainSensSliderRect.contains (e.mouseDownPosition))
+            if (trainSensSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
             {
                 proc.trainSensitivity = juce::jlimit (0.05f, 1.0f, (pt.x - trainSensSliderRect.getX()) / trainSensSliderRect.getWidth());
                 repaint(); return;
             }
-            if (hiHatBoostSliderRect.contains (e.mouseDownPosition))
+            if (hiHatBoostSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
             {
                 proc.hiHatBoost = juce::jlimit (0.0f, 1.0f, (pt.x - hiHatBoostSliderRect.getX()) / hiHatBoostSliderRect.getWidth());
                 repaint(); return;
             }
-            if (padSensSliderRect.contains (e.mouseDownPosition))
+            if (padSensSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
             {
                 proc.pads[selectedTrainPad].padSensitivity = juce::jlimit (0.1f, 1.0f, (pt.x - padSensSliderRect.getX()) / padSensSliderRect.getWidth());
                 repaint(); return;
             }
+            if (retrigLockSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
+            {
+                float norm = juce::jlimit (0.0f, 1.0f, (pt.x - retrigLockSliderRect.getX()) / retrigLockSliderRect.getWidth());
+                proc.triggerRetrigLockMs = 40.0f + norm * 160.0f;
+                repaint(); return;
+            }
         }
-        else if (currentTab == 4 && assignGateSliderRect.contains (e.mouseDownPosition))
+        else if (currentTab == 2 && qtDepthSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
+        {
+            float norm = juce::jlimit (0.0f, 1.0f, (pt.x - qtDepthSliderRect.getX()) / qtDepthSliderRect.getWidth());
+            proc.quarterToneCents = -65.0f + norm * 30.0f;
+            repaint(); return;
+        }
+        else if (currentTab == 3 && chordLockSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
+        {
+            float norm = juce::jlimit (0.0f, 1.0f, (pt.x - chordLockSliderRect.getX()) / chordLockSliderRect.getWidth());
+            proc.chordLockMs = 35.0f + norm * 165.0f;
+            repaint(); return;
+        }
+        else if (currentTab == 4 && assignGateSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
         {
             proc.globalGateLevel = juce::jlimit (0.02f, 0.95f, (pt.x - assignGateSliderRect.getX()) / assignGateSliderRect.getWidth());
             repaint(); return;
@@ -1954,6 +2432,7 @@ private:
     bool isDraggingMidi = false;
 
     std::array<juce::Rectangle<float>, 3> exclusiveModeRects;
+    std::array<juce::Rectangle<float>, 3> voiceModeRects;
     std::array<juce::Rectangle<float>, 5> tabRects;
     std::array<juce::Rectangle<float>, 8> padBounds;
     std::array<juce::Rectangle<float>, 8> padLoadRects;
@@ -1964,10 +2443,11 @@ private:
 
     juce::Rectangle<float> globalGateMeterRect;
     juce::Rectangle<float> midiRecButtonRect, quantizeCycleRect, midiDragButtonRect, midiClearButtonRect;
-    juce::Rectangle<float> playTrigSensRect, stickinessSliderRect, velocityCurveBoxRect, fixedVelToggleRect, playCalibBtnRect;
+    juce::Rectangle<float> playTrigSensRect, stickinessSliderRect, glideSliderRect, melodyLockSliderRect, velocityCurveBoxRect, fixedVelToggleRect, playCalibBtnRect;
     juce::Rectangle<float> keyTabAutoDetectRect, qtDepthSliderRect;
     juce::Rectangle<float> trainVoiceBtnRect, trainLoadButtonRect, trainPlayButtonRect, trainRevertButtonRect;
-    juce::Rectangle<float> trainSensSliderRect, hiHatBoostSliderRect, padSensSliderRect;
+    juce::Rectangle<float> trainSensSliderRect, hiHatBoostSliderRect, padSensSliderRect, retrigLockSliderRect;
+    juce::Rectangle<float> chordLockSliderRect;
     juce::Rectangle<float> condenserToggleRect, calibrateRoomBtnRect, assignGateSliderRect;
     juce::Rectangle<float> autoKeyBottomRect, rootCycleRect, maqamCycleRect, rangePresetRect, semiMinusRect, semiDisplayRect, semiPlusRect;
     juce::Rectangle<float> synthCycleRect, intellMuteRect, trigMuteRect;
