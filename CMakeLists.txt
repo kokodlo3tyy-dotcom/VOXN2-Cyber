@@ -35,11 +35,8 @@ target_compile_definitions(VOXN2CyberGold
 target_link_libraries(VOXN2CyberGold
     PRIVATE
         juce::juce_audio_utils
-        juce::juce_audio_devices
         juce::juce_audio_formats
         juce::juce_dsp
     PUBLIC
         juce::juce_recommended_config_flags
-        juce::juce_recommended_lto_flags
-        juce::juce_recommended_warning_flags
 )
