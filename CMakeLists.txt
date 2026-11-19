@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(VOXN2CyberGold VERSION 2.0.0)
+project(VOXN2CyberGold VERSION 2.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ add_subdirectory(JUCE)
 
 juce_add_plugin(VOXN2CyberGold
     COMPANY_NAME "VOXN Audio"
-    IS_SYNTH TRUE
+    IS_SYNTH FALSE
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT TRUE
     IS_MIDI_EFFECT FALSE
