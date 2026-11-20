@@ -11,6 +11,11 @@
 #include <array>
 #include <vector>
 
+static const char* kPluginVersionString = "1.0.0";
+static const char* kManufacturerName    = "Mido Mazzika";
+// When your website/contact/buy link is ready, put it between the quotes below:
+static const char* kManufacturerUrl     = "";
+
 enum EngineExclusiveMode
 {
     ModeMelodyOnly   = 0,
@@ -57,6 +62,13 @@ static const std::array<MaqamPreset, 10> kMaqamat = {{
 
 static const char* kNoteNames[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
 
+static const std::array<const char*, 4> kFactoryPresetNames = {{
+    "1. Oriental Wind / Nay",
+    "2. Clean Piano / Oud",
+    "3. Smart Chords Pad",
+    "4. Tight Beatbox Kit"
+}};
+
 struct ChordVoicingOption
 {
     juce::String label;
@@ -82,6 +94,7 @@ struct TriggerPadData
     float flashAlpha = 0.0f;
 
     float padSensitivity = 0.82f;
+    float levelTrim = 1.0f; // 0.15 .. 1.00 (controls outgoing MIDI velocity & internal sample level)
     bool isVoiceTrained = false;
     int trainedHits = 0;
     float featZCR = 0.0f;
@@ -107,10 +120,16 @@ public:
             pads[i].hasCustomSample = false;
             pads[i].isVoiceTrained = false;
             pads[i].padSensitivity = 0.84f;
+            pads[i].levelTrim = 1.0f;
         }
+
+        pitchTraceMidi.fill (60.0f);
+        pitchTraceTargetMidi.fill (60.0f);
+        pitchTraceValid.fill (false);
 
         selectedDegreeVoicing.fill (0);
         applyMaqamPreset (0, 2);
+        applyFactoryPreset (0);
     }
 
     ~VoxN2AudioProcessor() override = default;
@@ -147,9 +166,12 @@ public:
         pendingCandidateSamples = 0;
         releaseHoldSamplesRemaining = 0;
 
+        smoothedVibCents = 0.0f;
         lastSentPitchWheel = -1;
         lastSentModCC = -1;
         ccThrottleSamples = 0;
+        pbThrottleSamples = 0;
+        traceThrottleSamples = 0;
         pendingGlideCCUpdate.store (true);
     }
 
@@ -160,66 +182,228 @@ public:
         return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
     }
 
-    void toggleAutoKeyDetection()
+    // ==================== PRESETS SYSTEM ====================
+    juce::File getUserPresetsDirectory() const
+    {
+        auto dir = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                       .getChildFile (kManufacturerName)
+                       .getChildFile ("VoxNI")
+                       .getChildFile ("Presets");
+        if (! dir.exists()) dir.createDirectory();
+        return dir;
+    }
+
+    juce::Array<juce::File> getUserPresetFiles() const
+    {
+        return getUserPresetsDirectory().findChildFiles (juce::File::findFiles, false, "*.voxni");
+    }
+
+    void applyFactoryPreset (int index)
+    {
+        int idx = juce::jlimit (0, (int) kFactoryPresetNames.size() - 1, index);
+        currentPresetIndex = idx;
+        currentPresetName = kFactoryPresetNames[idx];
+
+        if (idx == 0) // Oriental Wind / Nay
+        {
+            setExclusiveEngineMode (ModeMelodyOnly);
+            setMelodyVoiceMode (VoiceLegato);
+            setGlideMs (85.0f);
+            melodyNoteLockMs = 22.0f;
+            stickiness = 0.62f;
+            vibratoEnabled.store (true);
+            vibratoDepthMode.store (1); // Med
+            sendAutomationCC.store (true);
+            ccSensitivityMode.store (2); // High
+            fixedVelocity127 = false;
+            velocityCurve = 0.35f;
+        }
+        else if (idx == 1) // Clean Piano / Oud
+        {
+            setExclusiveEngineMode (ModeMelodyOnly);
+            setMelodyVoiceMode (VoiceMono);
+            setGlideMs (0.0f);
+            melodyNoteLockMs = 35.0f;
+            stickiness = 0.72f;
+            vibratoEnabled.store (false);
+            vibratoDepthMode.store (0);
+            sendAutomationCC.store (true);
+            ccSensitivityMode.store (0); // Soft
+            fixedVelocity127 = false;
+            velocityCurve = 0.20f;
+        }
+        else if (idx == 2) // Smart Chords Pad
+        {
+            setExclusiveEngineMode (ModeChordsOnly);
+            chordLockMs = 85.0f;
+            stickiness = 0.76f;
+            vibratoEnabled.store (false);
+            sendAutomationCC.store (true);
+            ccSensitivityMode.store (0); // Soft
+            fixedVelocity127 = false;
+        }
+        else if (idx == 3) // Tight Beatbox Kit
+        {
+            setExclusiveEngineMode (ModeTriggersOnly);
+            triggerSensitivity = 0.88f;
+            trainSensitivity = 0.90f;
+            hiHatBoost = 0.90f;
+            triggerRetrigLockMs = 75.0f;
+            fixedVelocity127 = false;
+            velocityCurve = 0.45f;
+        }
+    }
+
+    juce::ValueTree buildStateValueTree() const
+    {
+        juce::ValueTree state ("VoxNIState");
+        state.setProperty ("presetName", currentPresetName, nullptr);
+        state.setProperty ("exclusiveMode", exclusiveMode.load(), nullptr);
+        state.setProperty ("rootNote", rootNote, nullptr);
+        state.setProperty ("maqamIndex", currentMaqamIndex, nullptr);
+        state.setProperty ("quarterToneCents", quarterToneCents, nullptr);
+        state.setProperty ("vocalRangePreset", vocalRangePreset, nullptr);
+        state.setProperty ("semitoneTranspose", semitoneTranspose, nullptr);
+        state.setProperty ("velocityCurve", velocityCurve, nullptr);
+        state.setProperty ("fixedVelocity127", fixedVelocity127, nullptr);
+        state.setProperty ("globalGateLevel", globalGateLevel, nullptr);
+        state.setProperty ("condenserMode", condenserMode, nullptr);
+        state.setProperty ("quantizeMode", quantizeMode, nullptr);
+        state.setProperty ("stickiness", stickiness, nullptr);
+        state.setProperty ("melodyVoiceMode", melodyVoiceMode.load(), nullptr);
+        state.setProperty ("glideMs", glideMs, nullptr);
+        state.setProperty ("melodyNoteLockMs", melodyNoteLockMs, nullptr);
+        state.setProperty ("chordLockMs", chordLockMs, nullptr);
+        state.setProperty ("triggerRetrigLockMs", triggerRetrigLockMs, nullptr);
+        state.setProperty ("triggerSensitivity", triggerSensitivity, nullptr);
+        state.setProperty ("trainSensitivity", trainSensitivity, nullptr);
+        state.setProperty ("hiHatBoost", hiHatBoost, nullptr);
+        state.setProperty ("vibratoEnabled", vibratoEnabled.load(), nullptr);
+        state.setProperty ("vibratoDepthMode", vibratoDepthMode.load(), nullptr);
+        state.setProperty ("sendAutomationCC", sendAutomationCC.load(), nullptr);
+        state.setProperty ("ccSensitivityMode", ccSensitivityMode.load(), nullptr);
+        state.setProperty ("synthPresetIndex", synthPresetIndex, nullptr);
+
+        for (int i = 0; i < 8; ++i)
+        {
+            state.setProperty ("padLvl" + juce::String (i), pads[i].levelTrim, nullptr);
+            state.setProperty ("padSens" + juce::String (i), pads[i].padSensitivity, nullptr);
+        }
+        return state;
+    }
+
+    void applyStateValueTree (const juce::ValueTree& state)
+    {
+        if (! state.isValid()) return;
+        currentPresetName = state.getProperty ("presetName", currentPresetName).toString();
+        setExclusiveEngineMode ((int) state.getProperty ("exclusiveMode", exclusiveMode.load()));
+        rootNote = (int) state.getProperty ("rootNote", 0);
+        currentMaqamIndex = (int) state.getProperty ("maqamIndex", 2);
+        quarterToneCents = (float) state.getProperty ("quarterToneCents", -50.0f);
+        vocalRangePreset = (int) state.getProperty ("vocalRangePreset", 0);
+        semitoneTranspose = (int) state.getProperty ("semitoneTranspose", 0);
+        velocityCurve = (float) state.getProperty ("velocityCurve", 0.35f);
+        fixedVelocity127 = (bool) state.getProperty ("fixedVelocity127", false);
+        globalGateLevel = (float) state.getProperty ("globalGateLevel", 0.16f);
+        condenserMode = (bool) state.getProperty ("condenserMode", true);
+        quantizeMode = (int) state.getProperty ("quantizeMode", 2);
+        stickiness = (float) state.getProperty ("stickiness", 0.65f);
+        melodyVoiceMode.store ((int) state.getProperty ("melodyVoiceMode", (int) VoiceMono));
+        glideMs = (float) state.getProperty ("glideMs", 0.0f);
+        melodyNoteLockMs = (float) state.getProperty ("melodyNoteLockMs", 28.0f);
+        chordLockMs = (float) state.getProperty ("chordLockMs", 75.0f);
+        triggerRetrigLockMs = (float) state.getProperty ("triggerRetrigLockMs", 85.0f);
+        triggerSensitivity = (float) state.getProperty ("triggerSensitivity", 0.86f);
+        trainSensitivity = (float) state.getProperty ("trainSensitivity", 0.90f);
+        hiHatBoost = (float) state.getProperty ("hiHatBoost", 0.85f);
+        vibratoEnabled.store ((bool) state.getProperty ("vibratoEnabled", true));
+        vibratoDepthMode.store (juce::jlimit (0, 2, (int) state.getProperty ("vibratoDepthMode", 1)));
+        sendAutomationCC.store ((bool) state.getProperty ("sendAutomationCC", true));
+        ccSensitivityMode.store (juce::jlimit (0, 2, (int) state.getProperty ("ccSensitivityMode", 1)));
+        synthPresetIndex = (int) state.getProperty ("synthPresetIndex", 0);
+
+        for (int i = 0; i < 8; ++i)
+        {
+            pads[i].levelTrim = juce::jlimit (0.15f, 1.0f, (float) state.getProperty ("padLvl" + juce::String (i), 1.0f));
+            pads[i].padSensitivity = juce::jlimit (0.10f, 1.0f, (float) state.getProperty ("padSens" + juce::String (i), 0.84f));
+        }
+
+        pendingGlideCCUpdate.store (true);
+        applyMaqamPreset (rootNote, currentMaqamIndex);
+    }
+
+    bool savePresetToFile (const juce::File& file)
+    {
+        currentPresetName = file.getFileNameWithoutExtension();
+        currentPresetIndex = -1;
+        auto state = buildStateValueTree();
+        std::unique_ptr<juce::XmlElement> xml (state.createXml());
+        if (xml != nullptr)
+            return xml->writeTo (file);
+        return false;
+    }
+
+    bool loadPresetFromFile (const juce::File& file)
+    {
+        if (! file.existsAsFile()) return false;
+        std::unique_ptr<juce::XmlElement> xml (juce::XmlDocument::parse (file));
+        if (xml == nullptr) return false;
+        auto state = juce::ValueTree::fromXml (*xml);
+        if (! state.isValid()) return false;
+        currentPresetIndex = -1;
+        applyStateValueTree (state);
+        currentPresetName = file.getFileNameWithoutExtension();
+        return true;
+    }
+
+    // ==================== AUTO ROOT DETECTION (ROOT ONLY) ====================
+    void toggleAutoRootDetection()
     {
         if (isDetectingKey.load())
         {
-            finalizeAutoKeyDetection();
+            finalizeAutoRootDetection();
         }
         else
         {
             const juce::SpinLock::ScopedLockType sl (autoKeyLock);
             pitchClassWeights.fill (0.0f);
-            quarterToneWeights.fill (0.0f);
             lastDetectedPitchClass = -1;
             totalDetectedVocalFrames = 0;
             autoKeySamplesElapsed = 0;
-            autoKeyStatusText = "LISTENING...";
+            autoRootStatusText = "LISTENING...";
             isDetectingKey.store (true);
         }
     }
 
-    void finalizeAutoKeyDetection()
+    void finalizeAutoRootDetection()
     {
         isDetectingKey.store (false);
         const juce::SpinLock::ScopedLockType sl (autoKeyLock);
 
-        if (totalDetectedVocalFrames < 8)
+        if (totalDetectedVocalFrames < 6)
         {
-            autoKeyStatusText = "TOO SHORT";
+            autoRootStatusText = "TOO SHORT";
             return;
         }
 
+        // Strongly weight the final resting note (Tonic / Qarar)
         if (lastDetectedPitchClass >= 0 && lastDetectedPitchClass < 12)
-            pitchClassWeights[lastDetectedPitchClass] *= 1.38f;
+            pitchClassWeights[lastDetectedPitchClass] *= 1.65f;
 
-        int bestRoot = 0;
-        int bestMaqam = 0;
-        float bestScore = -1.0e9f;
-
+        int bestRoot = rootNote;
+        float bestWeight = -1.0f;
         for (int r = 0; r < 12; ++r)
         {
-            for (int m = 0; m < (int) kMaqamat.size(); ++m)
+            if (pitchClassWeights[r] > bestWeight)
             {
-                float score = pitchClassWeights[r] * 1.45f;
-                for (int step = 0; step < 12; ++step)
-                {
-                    int pc = (r + step) % 12;
-                    int rule = kMaqamat[m].intervals[step];
-                    float w = pitchClassWeights[pc];
-                    float qtW = quarterToneWeights[pc];
-
-                    if (rule == 1) score += w * 1.0f - qtW * 0.5f;
-                    else if (rule == 2) score += w * 0.85f + qtW * 1.85f;
-                    else score -= w * 1.35f;
-                }
-                if (m == 9 || m == 8) score -= 0.05f;
-                if (score > bestScore) { bestScore = score; bestRoot = r; bestMaqam = m; }
+                bestWeight = pitchClassWeights[r];
+                bestRoot = r;
             }
         }
 
-        applyMaqamPreset (bestRoot, bestMaqam);
-        autoKeyStatusText = juce::String (kNoteNames[bestRoot]) + " " + juce::String (kMaqamat[bestMaqam].nameEn);
+        // Keep user's selected Maqam/Scale untouched; update Root only
+        applyMaqamPreset (bestRoot, currentMaqamIndex);
+        autoRootStatusText = "ROOT: " + juce::String (kNoteNames[bestRoot]);
     }
 
     void emitMidiEvent (const juce::MidiMessage& msg, juce::MidiBuffer& midiMessages, int sampleOffset = 0)
@@ -230,7 +414,7 @@ public:
 
     void emitPitchWheelIfChanged (int pbValue, juce::MidiBuffer& midiMessages, int sampleOffset = 0, bool forceSend = false)
     {
-        if (forceSend || pbValue != lastSentPitchWheel)
+        if (forceSend || std::abs (pbValue - lastSentPitchWheel) >= 6)
         {
             emitMidiEvent (juce::MidiMessage::pitchWheel (pitchMidiChannel, pbValue), midiMessages, sampleOffset);
             lastSentPitchWheel = pbValue;
@@ -564,6 +748,15 @@ public:
         return (betterTau > 0.0f) ? (float) (effSr / betterTau) : -1.0f;
     }
 
+    void pushPitchTracePoint (float liveMidi, float targetMidi, bool valid)
+    {
+        int idx = pitchTraceWriteIdx.load();
+        pitchTraceMidi[idx] = liveMidi;
+        pitchTraceTargetMidi[idx] = targetMidi;
+        pitchTraceValid[idx] = valid;
+        pitchTraceWriteIdx.store ((idx + 1) % kPitchTraceLen);
+    }
+
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) override
     {
         juce::ScopedNoDenormals noDenormals;
@@ -718,11 +911,19 @@ public:
         float zcr = (float) zeroCrossings / nSamp;
         float highRatio = highEnergy / (lowEnergy + highEnergy + 1.0e-7f);
         float sustainRatio = (peakAbs > 1.0e-5f) ? (rms / peakAbs) : 0.0f;
-        vowelEnv = 0.82f * vowelEnv + 0.18f * juce::jlimit (0.0f, 1.0f, rms * 8.5f);
+
+        // Expression / Mod sensitivity scaling (Soft / Med / High)
+        const float ccGainTable[3] = { 5.5f, 8.8f, 13.5f };
+        float ccGain = ccGainTable[juce::jlimit (0, 2, ccSensitivityMode.load())];
+        vowelEnv = 0.82f * vowelEnv + 0.18f * juce::jlimit (0.0f, 1.0f, rms * ccGain);
 
         const int mode = exclusiveMode.load();
         int manualPad = pendingPadTrigger.exchange (-1);
         if (manualPad >= 0 && manualPad < 8) fireTriggerPad (manualPad, 115, midiMessages, 0, numSamples);
+
+        float traceLiveMidi = 60.0f;
+        float traceTargetMidi = 60.0f;
+        bool traceIsValid = false;
 
         if (mode == ModeTriggersOnly)
         {
@@ -839,19 +1040,16 @@ public:
                     {
                         float rawExactMidi = 69.0f + 12.0f * std::log2 (detectedFreq / 440.0f);
                         int nearestNote = (int) std::round (rawExactMidi);
-                        float devCents = (rawExactMidi - (float) nearestNote) * 100.0f;
                         int pc = ((nearestNote % 12) + 12) % 12;
-
-                        if (devCents < -24.0f && devCents > -68.0f) quarterToneWeights[pc] += 1.0f;
 
                         pitchClassWeights[pc] += 1.0f;
                         lastDetectedPitchClass = pc;
                         totalDetectedVocalFrames++;
                     }
-                    if (autoKeySamplesElapsed >= (int) (currentSampleRate * 4.5) && totalDetectedVocalFrames >= 12)
+                    if (autoKeySamplesElapsed >= (int) (currentSampleRate * 3.8) && totalDetectedVocalFrames >= 10)
                         shouldFinishNow = true;
                 }
-                if (shouldFinishNow) finalizeAutoKeyDetection();
+                if (shouldFinishNow) finalizeAutoRootDetection();
             }
 
             if (validVocalPitch)
@@ -889,19 +1087,50 @@ public:
 
                 int snappedMidi = snapToMaqamScale (candidateMidi);
 
+                // Compute Live Vibrato / Free Pitch cents around target degree (including quarter-tone)
+                auto computeTargetCentsForNote = [&] (int noteMidi) -> float
+                {
+                    int pc = ((noteMidi % 12) + 12) % 12;
+                    float baseQtCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
+                    if (! vibratoEnabled.load() || manualNote >= 0)
+                    {
+                        smoothedVibCents = 0.0f;
+                        return baseQtCents;
+                    }
+
+                    const float vibMaxTable[3] = { 30.0f, 65.0f, 110.0f };
+                    const float vibScaleTable[3] = { 0.45f, 0.78f, 1.0f };
+                    int vIdx = juce::jlimit (0, 2, vibratoDepthMode.load());
+
+                    float idealMidi = (float) noteMidi + (baseQtCents / 100.0f);
+                    float rawDevCents = (rawMidi - idealMidi) * 100.0f;
+                    float scaledDev = juce::jlimit (-vibMaxTable[vIdx], vibMaxTable[vIdx], rawDevCents * vibScaleTable[vIdx]);
+                    smoothedVibCents = 0.72f * smoothedVibCents + 0.28f * scaledDev;
+                    return baseQtCents + smoothedVibCents;
+                };
+
                 if (snappedMidi == activeOutputMidiNote)
                 {
                     pendingCandidateMidi = -1;
                     pendingCandidateSamples = 0;
 
+                    float totalCents = computeTargetCentsForNote (snappedMidi);
+                    int pbValue = computePitchWheelForCents (totalCents);
+                    currentPitchBendValue.store (pbValue);
+                    currentCentsOffset.store ((int) std::round (totalCents));
+
+                    traceLiveMidi = vibratoEnabled.load() ? ((float) snappedMidi + totalCents / 100.0f) : rawMidi;
+                    traceTargetMidi = (float) snappedMidi + (((noteStates[((snappedMidi % 12) + 12) % 12] == 2) ? quarterToneCents : 0.0f) / 100.0f);
+                    traceIsValid = true;
+
                     if (mode == ModeMelodyOnly)
                     {
-                        int pc = ((snappedMidi % 12) + 12) % 12;
-                        float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
-                        int pbValue = computePitchWheelForCents (targetCents);
-                        currentPitchBendValue.store (pbValue);
-                        currentCentsOffset.store ((int) std::round (targetCents));
-                        emitPitchWheelIfChanged (pbValue, midiMessages, 0, false);
+                        pbThrottleSamples += numSamples;
+                        if (pbThrottleSamples >= (int) (currentSampleRate * 0.010))
+                        {
+                            pbThrottleSamples = 0;
+                            emitPitchWheelIfChanged (pbValue, midiMessages, 0, false);
+                        }
                     }
                 }
                 else
@@ -924,17 +1153,22 @@ public:
                             shouldCommit = true;
                     }
 
+                    traceLiveMidi = rawMidi;
+                    traceTargetMidi = (activeOutputMidiNote >= 0) ? (float) activeOutputMidiNote : (float) snappedMidi;
+                    traceIsValid = true;
+
                     if (shouldCommit)
                     {
                         pendingCandidateMidi = -1;
                         pendingCandidateSamples = 0;
                         activeRawMidiNote = candidateMidi;
+                        smoothedVibCents = 0.0f;
 
                         int pc = ((snappedMidi % 12) + 12) % 12;
-                        float targetCents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
-                        int pbValue = computePitchWheelForCents (targetCents);
+                        float totalCents = computeTargetCentsForNote (snappedMidi);
+                        int pbValue = computePitchWheelForCents (totalCents);
                         currentPitchBendValue.store (pbValue);
-                        currentCentsOffset.store ((int) std::round (targetCents));
+                        currentCentsOffset.store ((int) std::round (totalCents));
 
                         juce::uint8 dynVel = (manualNote >= 0) ? 110 : computeDynamicVelocity (rms, gateOpenThresh);
                         int oldNote = activeOutputMidiNote;
@@ -1043,7 +1277,6 @@ public:
                 }
             }
 
-            // Smooth MIDI CC Automation (Mod Wheel CC1 + Expression CC11) driven by vocal level
             if (sendAutomationCC.load())
             {
                 ccThrottleSamples += numSamples;
@@ -1065,14 +1298,21 @@ public:
             }
         }
 
+        // Push live scrolling pitch analyzer history (~30-40 Hz)
+        traceThrottleSamples += numSamples;
+        if (traceThrottleSamples >= (int) (currentSampleRate * 0.024))
+        {
+            traceThrottleSamples = 0;
+            pushPitchTracePoint (traceLiveMidi, traceTargetMidi, traceIsValid);
+        }
+
         float* outL = buffer.getWritePointer (0);
         float* outR = (numOutChannels > 1) ? buffer.getWritePointer (1) : outL;
 
         if (! intellAudioMuted.load() && activeOutputMidiNote >= 0 && mode != ModeTriggersOnly)
         {
-            int pc = ((activeOutputMidiNote % 12) + 12) % 12;
-            float cents = (noteStates[pc] == 2) ? quarterToneCents : 0.0f;
-            double targetFreq = 440.0 * std::pow (2.0, ((double) activeOutputMidiNote - 69.0 + cents / 100.0) / 12.0);
+            float cents = (float) currentCentsOffset.load();
+            double targetFreq = 440.0 * std::pow (2.0, ((double) activeOutputMidiNote - 69.0 + (double) cents / 100.0) / 12.0);
 
             if (! hadPreviousSynthNote || glideMs <= 1.0f)
                 currentSynthFreq = targetFreq;
@@ -1154,7 +1394,7 @@ public:
         if (activeOutputMidiNote >= 0)
         {
             emitMidiEvent (juce::MidiMessage::noteOff (pitchMidiChannel, activeOutputMidiNote), midiMessages, 0);
-            emitPitchWheelIfChanged (8192, midiMessages, 0, false);
+            emitPitchWheelIfChanged (8192, midiMessages, 0, true);
         }
         if (sendAutomationCC.load() && lastSentModCC > 0)
         {
@@ -1168,6 +1408,7 @@ public:
         pendingCandidateMidi = -1;
         pendingCandidateSamples = 0;
         releaseHoldSamplesRemaining = 0;
+        smoothedVibCents = 0.0f;
         hadPreviousSynthNote = false;
         currentDetectedMidiNote.store (-1);
         currentPitchBendValue.store (8192);
@@ -1190,14 +1431,17 @@ public:
     {
         auto& pad = pads[padIdx];
         pad.flashAlpha = 1.0f;
-        lastPadGain[padIdx] = (float) velocity / 127.0f * 0.75f;
+
+        // Per-pad Level / Velocity Trim scales both outgoing MIDI velocity and internal sample gain
+        int trimmedVel = juce::jlimit (1, 127, (int) std::round ((float) velocity * pad.levelTrim));
+        lastPadGain[padIdx] = ((float) trimmedVel / 127.0f) * 0.80f;
         if (pad.hasCustomSample) pad.playhead = 0;
 
         int maxIdx    = juce::jmax (0, numSamplesInBlock - 1);
         int onOffset  = (maxIdx > 0) ? juce::jlimit (0, maxIdx - 1, sampleOffset) : 0;
         int offOffset = (maxIdx > 0) ? juce::jmin (onOffset + 32, maxIdx) : 0;
 
-        emitMidiEvent (juce::MidiMessage::noteOn  (triggersMidiChannel, pad.midiNote, velocity), midiMessages, onOffset);
+        emitMidiEvent (juce::MidiMessage::noteOn  (triggersMidiChannel, pad.midiNote, (juce::uint8) trimmedVel), midiMessages, onOffset);
         emitMidiEvent (juce::MidiMessage::noteOff (triggersMidiChannel, pad.midiNote), midiMessages, offOffset);
     }
 
@@ -1272,24 +1516,7 @@ public:
 
     void getStateInformation (juce::MemoryBlock& destData) override
     {
-        juce::ValueTree state ("VoxNIState");
-        state.setProperty ("rootNote", rootNote, nullptr);
-        state.setProperty ("maqamIndex", currentMaqamIndex, nullptr);
-        state.setProperty ("quarterToneCents", quarterToneCents, nullptr);
-        state.setProperty ("vocalRangePreset", vocalRangePreset, nullptr);
-        state.setProperty ("semitoneTranspose", semitoneTranspose, nullptr);
-        state.setProperty ("velocityCurve", velocityCurve, nullptr);
-        state.setProperty ("fixedVelocity127", fixedVelocity127, nullptr);
-        state.setProperty ("globalGateLevel", globalGateLevel, nullptr);
-        state.setProperty ("condenserMode", condenserMode, nullptr);
-        state.setProperty ("quantizeMode", quantizeMode, nullptr);
-        state.setProperty ("stickiness", stickiness, nullptr);
-        state.setProperty ("melodyVoiceMode", melodyVoiceMode.load(), nullptr);
-        state.setProperty ("glideMs", glideMs, nullptr);
-        state.setProperty ("melodyNoteLockMs", melodyNoteLockMs, nullptr);
-        state.setProperty ("chordLockMs", chordLockMs, nullptr);
-        state.setProperty ("triggerRetrigLockMs", triggerRetrigLockMs, nullptr);
-        state.setProperty ("sendAutomationCC", sendAutomationCC.load(), nullptr);
+        auto state = buildStateValueTree();
         std::unique_ptr<juce::XmlElement> xml (state.createXml());
         copyXmlToBinary (*xml, destData);
     }
@@ -1298,35 +1525,23 @@ public:
     {
         std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
         if (xmlState != nullptr)
-        {
-            auto state = juce::ValueTree::fromXml (*xmlState);
-            rootNote = (int) state.getProperty ("rootNote", 0);
-            currentMaqamIndex = (int) state.getProperty ("maqamIndex", 2);
-            quarterToneCents = (float) state.getProperty ("quarterToneCents", -50.0f);
-            vocalRangePreset = (int) state.getProperty ("vocalRangePreset", 0);
-            semitoneTranspose = (int) state.getProperty ("semitoneTranspose", 0);
-            velocityCurve = (float) state.getProperty ("velocityCurve", 0.35f);
-            fixedVelocity127 = (bool) state.getProperty ("fixedVelocity127", false);
-            globalGateLevel = (float) state.getProperty ("globalGateLevel", 0.16f);
-            condenserMode = (bool) state.getProperty ("condenserMode", true);
-            quantizeMode = (int) state.getProperty ("quantizeMode", 2);
-            stickiness = (float) state.getProperty ("stickiness", 0.65f);
-            melodyVoiceMode.store ((int) state.getProperty ("melodyVoiceMode", (int) VoiceMono));
-            glideMs = (float) state.getProperty ("glideMs", 0.0f);
-            melodyNoteLockMs = (float) state.getProperty ("melodyNoteLockMs", 28.0f);
-            chordLockMs = (float) state.getProperty ("chordLockMs", 75.0f);
-            triggerRetrigLockMs = (float) state.getProperty ("triggerRetrigLockMs", 85.0f);
-            sendAutomationCC.store ((bool) state.getProperty ("sendAutomationCC", true));
-            pendingGlideCCUpdate.store (true);
-            applyMaqamPreset (rootNote, currentMaqamIndex);
-        }
+            applyStateValueTree (juce::ValueTree::fromXml (*xmlState));
     }
+
+    static constexpr int kPitchTraceLen = 96;
+    std::array<float, kPitchTraceLen> pitchTraceMidi {};
+    std::array<float, kPitchTraceLen> pitchTraceTargetMidi {};
+    std::array<bool,  kPitchTraceLen> pitchTraceValid {};
+    std::atomic<int> pitchTraceWriteIdx { 0 };
 
     std::array<TriggerPadData, 8> pads;
     std::array<int, 12> noteStates { 1, 0, 1, 0, 2, 1, 0, 1, 0, 1, 0, 2 };
     std::array<int, 7> degreePitchClasses { 0, 2, 4, 5, 7, 9, 11 };
     std::array<std::vector<ChordVoicingOption>, 7> degreeChordOptions;
     std::array<int, 7> selectedDegreeVoicing { 0, 0, 0, 0, 0, 0, 0 };
+
+    int currentPresetIndex = 0;
+    juce::String currentPresetName { "1. Oriental Wind / Nay" };
 
     int rootNote = 0;
     int currentMaqamIndex = 2;
@@ -1339,7 +1554,11 @@ public:
     float chordLockMs = 75.0f;
     float triggerRetrigLockMs = 85.0f;
     std::atomic<bool> pendingGlideCCUpdate { true };
+
+    std::atomic<bool> vibratoEnabled { true };
+    std::atomic<int>  vibratoDepthMode { 1 };   // 0=Soft, 1=Med, 2=Deep
     std::atomic<bool> sendAutomationCC { true };
+    std::atomic<int>  ccSensitivityMode { 1 };  // 0=Soft, 1=Med, 2=High
 
     float velocityCurve = 0.35f;
     int minVelocity = 35;
@@ -1357,7 +1576,7 @@ public:
     std::atomic<bool> isCalibratingRoom { false };
 
     std::atomic<bool> isDetectingKey { false };
-    juce::String autoKeyStatusText { "AUTO KEY" };
+    juce::String autoRootStatusText { "AUTO ROOT" };
 
     float triggerSensitivity = 0.86f;
     float trainSensitivity   = 0.90f;
@@ -1412,7 +1631,6 @@ private:
 
     juce::SpinLock autoKeyLock;
     std::array<float, 12> pitchClassWeights {};
-    std::array<float, 12> quarterToneWeights {};
     int lastDetectedPitchClass = -1;
     int totalDetectedVocalFrames = 0;
     int autoKeySamplesElapsed = 0;
@@ -1426,9 +1644,12 @@ private:
     int legatoOffSamplesRemaining = 0;
     std::vector<PolyVoice> polyMelodyVoices;
 
+    float smoothedVibCents = 0.0f;
     int lastSentPitchWheel = -1;
     int lastSentModCC = -1;
     int ccThrottleSamples = 0;
+    int pbThrottleSamples = 0;
+    int traceThrottleSamples = 0;
 
     float prevTrigLevel = 0.0f;
     int triggerCooldownSamples = 0;
@@ -1513,6 +1734,64 @@ public:
             });
     }
 
+    void openSavePresetDialog()
+    {
+        fileChooser = std::make_unique<juce::FileChooser> (
+            "Save VoxNI Preset", proc.getUserPresetsDirectory().getChildFile ("MyPreset.voxni"), "*.voxni");
+        fileChooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+            [this] (const juce::FileChooser& fc)
+            {
+                auto file = fc.getResult();
+                if (file != juce::File{})
+                {
+                    if (! file.hasFileExtension (".voxni"))
+                        file = file.withFileExtension (".voxni");
+                    proc.savePresetToFile (file);
+                    repaint();
+                }
+            });
+    }
+
+    void showPresetsMenu()
+    {
+        juce::PopupMenu menu;
+        menu.addSectionHeader ("Factory Presets");
+        for (int i = 0; i < (int) kFactoryPresetNames.size(); ++i)
+            menu.addItem (1 + i, kFactoryPresetNames[i], true, proc.currentPresetIndex == i);
+
+        auto userFiles = proc.getUserPresetFiles();
+        if (! userFiles.isEmpty())
+        {
+            menu.addSeparator();
+            menu.addSectionHeader ("User Presets");
+            for (int i = 0; i < userFiles.size(); ++i)
+                menu.addItem (100 + i, userFiles[i].getFileNameWithoutExtension(), true,
+                              proc.currentPresetIndex < 0 && proc.currentPresetName == userFiles[i].getFileNameWithoutExtension());
+        }
+
+        menu.addSeparator();
+        menu.addItem (900, "Save Current Settings as Preset...");
+
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (localAreaToGlobal (presetNameRect.toNearestInt())),
+            [this, userFiles] (int result)
+            {
+                if (result >= 1 && result <= (int) kFactoryPresetNames.size())
+                {
+                    proc.applyFactoryPreset (result - 1);
+                    repaint();
+                }
+                else if (result >= 100 && result < 100 + userFiles.size())
+                {
+                    proc.loadPresetFromFile (userFiles[result - 100]);
+                    repaint();
+                }
+                else if (result == 900)
+                {
+                    openSavePresetDialog();
+                }
+            });
+    }
+
     void paint (juce::Graphics& g) override
     {
         const juce::Colour bgDark (0xff1b1b1f), cardDark (0xff25252b), cyberGold (0xffe5b84b);
@@ -1522,62 +1801,97 @@ public:
         g.setColour (juce::Colour (0xff171717));
         g.fillRect (0, 0, getWidth(), 42);
 
+        // Logo (Clickable -> Waves-style About Popup)
+        logoClickRect = { 8.0f, 4.0f, 88.0f, 34.0f };
         if (logoImage.isValid())
         {
-            g.drawImageWithin (logoImage, 8, 5, 92, 32, juce::RectanglePlacement::centred);
+            g.drawImageWithin (logoImage, 8, 5, 88, 32, juce::RectanglePlacement::centred);
         }
         else
         {
             g.setFont (juce::FontOptions (17.0f).withStyle ("Bold"));
             g.setColour (cyberGold);
-            g.drawText ("VoxNI", 10, 8, 90, 26, juce::Justification::centredLeft);
+            g.drawText ("VoxNI", logoClickRect, juce::Justification::centredLeft);
         }
 
+        // 3 Exclusive Modes
         const int activeMode = proc.exclusiveMode.load();
-        const char* modeNames[3] = { "1. MELODY ONLY", "2. TRIGGERS ONLY", "3. CHORDS ONLY" };
+        const char* modeNames[3] = { "1. MELODY", "2. TRIGGERS", "3. CHORDS" };
+        const float modeX[3] = { 102.0f, 188.0f, 280.0f };
+        const float modeW[3] = { 82.0f,  88.0f,  82.0f };
         for (int m = 0; m < 3; ++m)
         {
-            exclusiveModeRects[m] = { 106.0f + m * 120.0f, 8.0f, 114.0f, 26.0f };
+            exclusiveModeRects[m] = { modeX[m], 8.0f, modeW[m], 26.0f };
             bool isCurr = (activeMode == m);
             g.setColour (isCurr ? (m == 1 ? neonPink : cyberGold) : juce::Colour (0xff23232a));
             g.fillRoundedRectangle (exclusiveModeRects[m], 5.0f);
             g.setColour (isCurr ? juce::Colours::black : textBright);
-            g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+            g.setFont (juce::FontOptions (10.0f).withStyle ("Bold"));
             g.drawText (modeNames[m], exclusiveModeRects[m], juce::Justification::centred);
         }
 
+        // Presets Bar (< [Preset Name] > [SAVE])
+        presetPrevRect = { 368.0f, 8.0f, 20.0f, 26.0f };
+        presetNameRect = { 390.0f, 8.0f, 136.0f, 26.0f };
+        presetNextRect = { 528.0f, 8.0f, 20.0f, 26.0f };
+        presetSaveRect = { 552.0f, 8.0f, 40.0f, 26.0f };
+
+        g.setColour (juce::Colour (0xff26262f));
+        g.fillRoundedRectangle (presetPrevRect, 4.0f);
+        g.fillRoundedRectangle (presetNameRect, 4.0f);
+        g.fillRoundedRectangle (presetNextRect, 4.0f);
+        g.setColour (cyberGold.withAlpha (0.45f));
+        g.drawRoundedRectangle (presetNameRect, 4.0f, 1.0f);
+
+        g.setColour (cyberGold);
+        g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+        g.drawText ("<", presetPrevRect, juce::Justification::centred);
+        g.drawText (">", presetNextRect, juce::Justification::centred);
+        g.setColour (textBright);
+        g.setFont (juce::FontOptions (10.0f).withStyle ("Bold"));
+        g.drawFittedText (proc.currentPresetName, presetNameRect.reduced (4.0f, 1.0f).toNearestInt(), juce::Justification::centred, 1);
+
+        g.setColour (juce::Colour (0xff2b3a30));
+        g.fillRoundedRectangle (presetSaveRect, 4.0f);
+        g.setColour (neonGreen);
+        g.setFont (juce::FontOptions (9.5f).withStyle ("Bold"));
+        g.drawText ("SAVE", presetSaveRect, juce::Justification::centred);
+
+        // MIDI Capture Controls
         bool isRec = proc.isCapturingMidi.load();
         int noteCnt = proc.capturedNoteCount.load();
 
-        midiRecButtonRect = { 474.0f, 8.0f, 102.0f, 26.0f };
+        midiRecButtonRect = { 598.0f, 8.0f, 82.0f, 26.0f };
         g.setColour (isRec ? neonPink : juce::Colour (0xff2a2a32));
         g.fillRoundedRectangle (midiRecButtonRect, 5.0f);
         g.setColour (isRec ? textBright : neonPink);
-        g.fillEllipse (midiRecButtonRect.getX() + 10.0f, midiRecButtonRect.getY() + 9.0f, 8.0f, 8.0f);
+        g.fillEllipse (midiRecButtonRect.getX() + 7.0f, midiRecButtonRect.getY() + 9.0f, 7.0f, 7.0f);
         g.setColour (textBright);
-        g.drawText (isRec ? ("STOP [" + juce::String (noteCnt) + "]") : "REC MIDI",
-                    midiRecButtonRect.withTrimmedLeft (16.0f), juce::Justification::centred);
+        g.setFont (juce::FontOptions (10.0f).withStyle ("Bold"));
+        g.drawText (isRec ? ("STOP " + juce::String (noteCnt)) : "REC MIDI",
+                    midiRecButtonRect.withTrimmedLeft (13.0f), juce::Justification::centred);
 
-        quantizeCycleRect = { 582.0f, 8.0f, 106.0f, 26.0f };
+        quantizeCycleRect = { 684.0f, 8.0f, 76.0f, 26.0f };
         g.setColour (proc.quantizeMode > 0 ? juce::Colour (0xff2d2a1e) : juce::Colour (0xff2a2a32));
         g.fillRoundedRectangle (quantizeCycleRect, 5.0f);
         g.setColour (cyberGold);
-        const char* qLabels[3] = { "Quant: OFF", "Quant: 1/8", "Quant: 1/16" };
+        const char* qLabels[3] = { "Q: OFF", "Q: 1/8", "Q: 1/16" };
         g.drawText (qLabels[proc.quantizeMode % 3], quantizeCycleRect, juce::Justification::centred);
 
-        midiDragButtonRect = { 694.0f, 8.0f, 186.0f, 26.0f };
+        midiDragButtonRect = { 764.0f, 8.0f, 134.0f, 26.0f };
         g.setColour (noteCnt > 0 ? neonGreen : cyberGold);
         g.fillRoundedRectangle (midiDragButtonRect, 5.0f);
         g.setColour (juce::Colours::black);
-        g.drawText ("DRAG MIDI TO DAW (" + juce::String (noteCnt) + ")", midiDragButtonRect, juce::Justification::centred);
+        g.drawText ("DRAG MIDI (" + juce::String (noteCnt) + ")", midiDragButtonRect, juce::Justification::centred);
 
-        midiClearButtonRect = { 886.0f, 8.0f, 62.0f, 26.0f };
+        midiClearButtonRect = { 902.0f, 8.0f, 48.0f, 26.0f };
         g.setColour (juce::Colour (0xff2a2a32));
         g.fillRoundedRectangle (midiClearButtonRect, 5.0f);
         g.setColour (textBright);
-        g.drawText ("CLEAR", midiClearButtonRect, juce::Justification::centred);
+        g.drawText ("CLR", midiClearButtonRect, juce::Justification::centred);
 
-        const char* tabTitles[5] = { "Play", "Train (Beatbox)", "Key (Auto/Maqam)", "Chords (Matrix)", "Assign & Mic" };
+        // 5 Tabs
+        const char* tabTitles[5] = { "Play", "Train (Beatbox)", "Key (Root/Maqam)", "Chords (Matrix)", "Assign & Mic" };
         for (int i = 0; i < 5; ++i)
         {
             tabRects[i] = { 130.0f + i * 144.0f, 46.0f, 138.0f, 30.0f };
@@ -1585,16 +1899,18 @@ public:
             g.setColour (isCurr ? cardDark : juce::Colour (0xff19191e));
             g.fillRoundedRectangle (tabRects[i], 6.0f);
             g.setColour (isCurr ? cyberGold : textMuted);
-            g.setFont (juce::FontOptions (12.0f).withStyle ("Bold"));
+            g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
             g.drawText (tabTitles[i], tabRects[i], juce::Justification::centred);
         }
 
+        // Main Card
         juce::Rectangle<float> mainCard (28.0f, 74.0f, 920.0f, 336.0f);
         g.setColour (cardDark);
         g.fillRoundedRectangle (mainCard, 10.0f);
         g.setColour (cyberGold.withAlpha (0.28f));
         g.drawRoundedRectangle (mainCard, 10.0f, 1.2f);
 
+        // Left Global Gate LED Meter
         globalGateMeterRect = { 7.0f, 84.0f, 14.0f, 316.0f };
         float rmsNorm = juce::jlimit (0.0f, 1.0f, proc.currentInputRms.load() * 14.0f);
         for (int d = 0; d < 28; ++d)
@@ -1614,7 +1930,108 @@ public:
         else if (currentTab == 3) drawChordsTab (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
         else if (currentTab == 4) drawAssignTab (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
 
-        drawBottomSection (g, cyberGold, neonPink, neonGreen, textBright);
+        drawBottomSection (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
+
+        // Draw Floating Arabic Hover Tooltip (when About Popup is closed)
+        if (! showAboutPopup && currentTooltipText.isNotEmpty())
+            drawArabicTooltip (g, cyberGold, textBright);
+
+        // Draw Waves-Style About Popup Modal on top of everything
+        if (showAboutPopup)
+            drawAboutPopupModal (g, cyberGold, neonPink, neonGreen, textBright, textMuted);
+    }
+
+    void drawLivePitchAnalyzer (juce::Graphics& g, juce::Rectangle<float> area,
+                                juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
+    {
+        pitchAnalyzerRect = area;
+        g.setColour (juce::Colour (0xff15151a));
+        g.fillRoundedRectangle (area, 7.0f);
+        g.setColour (gold.withAlpha (0.35f));
+        g.drawRoundedRectangle (area, 7.0f, 1.1f);
+
+        // Gridlines
+        g.setColour (muted.withAlpha (0.14f));
+        for (int row = 1; row <= 3; ++row)
+        {
+            float gy = area.getY() + (area.getHeight() * (float) row / 4.0f);
+            g.drawHorizontalLine ((int) gy, area.getX() + 4.0f, area.getRight() - 4.0f);
+        }
+
+        // Header & Live Cents Badge
+        g.setColour (gold);
+        g.setFont (juce::FontOptions (9.5f).withStyle ("Bold"));
+        g.drawText ("LIVE PITCH ANALYZER", (int) area.getX() + 8, (int) area.getY() + 3, 130, 14, juce::Justification::centredLeft);
+
+        int activeMidi = proc.currentDetectedMidiNote.load();
+        int centsOff = proc.currentCentsOffset.load();
+        juce::String badge = (activeMidi >= 0)
+            ? (juce::String (kNoteNames[((activeMidi % 12) + 12) % 12]) + juce::String (activeMidi / 12 - 1)
+               + " (" + (centsOff >= 0 ? "+" : "") + juce::String (centsOff) + "c)")
+            : "IDLE";
+        g.setColour (activeMidi >= 0 ? green : muted);
+        g.drawText (badge, (int) area.getRight() - 108, (int) area.getY() + 3, 100, 14, juce::Justification::centredRight);
+
+        // Determine dynamic center MIDI for graph vertical framing
+        int writeIdx = proc.pitchTraceWriteIdx.load();
+        float centerMidi = 60.0f;
+        for (int i = 1; i <= VoxN2AudioProcessor::kPitchTraceLen; ++i)
+        {
+            int idx = (writeIdx - i + VoxN2AudioProcessor::kPitchTraceLen) % VoxN2AudioProcessor::kPitchTraceLen;
+            if (proc.pitchTraceValid[idx]) { centerMidi = proc.pitchTraceTargetMidi[idx]; break; }
+        }
+
+        const float plotX = area.getX() + 6.0f;
+        const float plotW = area.getWidth() - 12.0f;
+        const float plotY = area.getY() + 20.0f;
+        const float plotH = area.getHeight() - 26.0f;
+        const float semiSpan = 8.0f; // +/- 4 semitones vertical range
+
+        auto midiToY = [&] (float m) -> float
+        {
+            float norm = 0.5f - ((m - centerMidi) / semiSpan);
+            return plotY + juce::jlimit (0.04f, 0.96f, norm) * plotH;
+        };
+
+        juce::Path targetPath, livePath;
+        bool inTarget = false, inLive = false;
+
+        for (int s = 0; s < VoxN2AudioProcessor::kPitchTraceLen; ++s)
+        {
+            int idx = (writeIdx + s) % VoxN2AudioProcessor::kPitchTraceLen;
+            float px = plotX + ((float) s / (float) (VoxN2AudioProcessor::kPitchTraceLen - 1)) * plotW;
+
+            if (proc.pitchTraceValid[idx])
+            {
+                float ty = midiToY (proc.pitchTraceTargetMidi[idx]);
+                float ly = midiToY (proc.pitchTraceMidi[idx]);
+
+                if (! inTarget) { targetPath.startNewSubPath (px, ty); inTarget = true; }
+                else targetPath.lineTo (px, ty);
+
+                if (! inLive) { livePath.startNewSubPath (px, ly); inLive = true; }
+                else livePath.lineTo (px, ly);
+            }
+            else
+            {
+                inTarget = false;
+                inLive = false;
+            }
+        }
+
+        g.setColour (gold.withAlpha (0.42f));
+        g.strokePath (targetPath, juce::PathStrokeType (1.5f));
+        g.setColour (proc.vibratoEnabled.load() ? pink : green);
+        g.strokePath (livePath, juce::PathStrokeType (2.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        // Glowing head dot on active vocal pitch
+        int lastIdx = (writeIdx - 1 + VoxN2AudioProcessor::kPitchTraceLen) % VoxN2AudioProcessor::kPitchTraceLen;
+        if (proc.pitchTraceValid[lastIdx])
+        {
+            float hy = midiToY (proc.pitchTraceMidi[lastIdx]);
+            g.setColour (bright);
+            g.fillEllipse (plotX + plotW - 4.0f, hy - 3.5f, 7.0f, 7.0f);
+        }
     }
 
     void drawPlayTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
@@ -1642,31 +2059,47 @@ public:
             g.setColour (pad.hasCustomSample ? gold : muted.withAlpha (0.4f));
             g.drawRoundedRectangle (r, 7.0f, 1.4f);
 
-            padLoadRects[i] = { r.getX() + 4.0f, r.getY() + 4.0f, 34.0f, 16.0f };
+            padLoadRects[i] = { r.getX() + 4.0f, r.getY() + 4.0f, 34.0f, 15.0f };
             g.setColour (gold.withAlpha (0.25f));
             g.fillRoundedRectangle (padLoadRects[i], 3.0f);
             g.setColour (gold);
-            g.setFont (juce::FontOptions (9.0f));
+            g.setFont (juce::FontOptions (8.5f));
             g.drawText ("LOAD", padLoadRects[i], juce::Justification::centred);
 
             if (pad.isVoiceTrained)
             {
                 g.setColour (green);
-                g.drawText ("MIC OK", (int) r.getRight() - 42, (int) r.getY() + 4, 38, 16, juce::Justification::centredRight);
+                g.drawText ("MIC OK", (int) r.getRight() - 40, (int) r.getY() + 4, 36, 15, juce::Justification::centredRight);
             }
 
             g.setColour (bright);
             g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
-            g.drawText (pad.name, (int) r.getX() + 5, (int) r.getY() + 36, 74, 18, juce::Justification::centredLeft);
+            g.drawText (pad.name, (int) r.getX() + 5, (int) r.getY() + 26, 74, 16, juce::Justification::centredLeft);
 
             g.setColour (pad.hasCustomSample ? gold : muted);
-            g.setFont (juce::FontOptions (9.5f));
+            g.setFont (juce::FontOptions (9.0f));
             g.drawText (pad.hasCustomSample ? pad.customFileName : "[Empty Pad]",
-                        (int) r.getX() + 5, (int) r.getY() + 58, 74, 18, juce::Justification::centredLeft);
+                        (int) r.getX() + 5, (int) r.getY() + 43, 74, 15, juce::Justification::centredLeft);
+
+            // Per-Pad Level / Velocity Trim Bar
+            padLevelRects[i] = { r.getX() + 5.0f, r.getBottom() - 18.0f, r.getWidth() - 10.0f, 13.0f };
+            g.setColour (juce::Colour (0xff121216));
+            g.fillRoundedRectangle (padLevelRects[i], 3.5f);
+            g.setColour (gold.withAlpha (0.85f));
+            g.fillRoundedRectangle (padLevelRects[i].getX(), padLevelRects[i].getY(),
+                                    padLevelRects[i].getWidth() * pad.levelTrim, padLevelRects[i].getHeight(), 3.5f);
+            g.setColour (juce::Colours::black);
+            g.setFont (juce::FontOptions (8.5f).withStyle ("Bold"));
+            g.drawText ("LVL " + juce::String ((int) (pad.levelTrim * 100.0f)) + "%", padLevelRects[i], juce::Justification::centred);
         }
 
-        drawPitchRadarWheel (g, 485.0f, 245.0f, 118.0f, gold, pink, bright);
+        // Center Top: Live Scrolling Pitch Analyzer (Auto-Tune Style)
+        drawLivePitchAnalyzer (g, { 330.0f, 82.0f, 312.0f, 102.0f }, gold, pink, green, bright, muted);
 
+        // Center Bottom: Pitch Radar Wheel
+        drawPitchRadarWheel (g, 486.0f, 294.0f, 98.0f, gold, pink, bright);
+
+        // Right Column: Melody Controls + Velocity Curve
         g.setColour (muted);
         g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
         g.drawText ("Stickiness: " + juce::String ((int) (proc.stickiness * 100.0f)) + "%", 655, 80, 96, 16, juce::Justification::centredLeft);
@@ -1781,27 +2214,28 @@ public:
             if (state > 0)
             {
                 g.setColour (isPlaying ? juce::Colours::black : bright);
-                g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
-                g.drawText (juce::String (kNoteNames[i]) + (state == 2 ? " 1/2b" : ""), (int) tx - 22, (int) ty - 10, 44, 20, juce::Justification::centred);
+                g.setFont (juce::FontOptions (10.0f).withStyle ("Bold"));
+                g.drawText (juce::String (kNoteNames[i]) + (state == 2 ? " 1/2b" : ""), (int) tx - 22, (int) ty - 9, 44, 18, juce::Justification::centred);
             }
         }
 
+        float innerR = radius * 0.42f;
         g.setColour (juce::Colour (0xff19191f));
-        g.fillEllipse (cx - 46.0f, cy - 46.0f, 92.0f, 92.0f);
+        g.fillEllipse (cx - innerR, cy - innerR, innerR * 2.0f, innerR * 2.0f);
         g.setColour (gold);
-        g.drawEllipse (cx - 46.0f, cy - 46.0f, 92.0f, 92.0f, 2.0f);
+        g.drawEllipse (cx - innerR, cy - innerR, innerR * 2.0f, innerR * 2.0f, 1.8f);
 
         juce::String centerNote = (activeMidi >= 0) ? (juce::String (kNoteNames[activePc]) + juce::String (activeMidi / 12 - 1)) : "READY";
         g.setColour (bright);
-        g.setFont (juce::FontOptions (15.0f).withStyle ("Bold"));
-        g.drawText (centerNote, (int) cx - 40, (int) cy - 12, 80, 24, juce::Justification::centred);
+        g.setFont (juce::FontOptions (13.5f).withStyle ("Bold"));
+        g.drawText (centerNote, (int) cx - 36, (int) cy - 11, 72, 22, juce::Justification::centred);
     }
 
     void drawTrainTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
     {
         g.setColour (gold);
         g.setFont (juce::FontOptions (12.5f).withStyle ("Bold"));
-        g.drawText ("BEATBOX & HI-HAT TRAINER (ANTI-ROLL RETRIG LOCK):", 48, 82, 760, 20, juce::Justification::centredLeft);
+        g.drawText ("BEATBOX & HI-HAT TRAINER (PER-PAD LEVEL & RETRIG LOCK):", 48, 82, 760, 20, juce::Justification::centredLeft);
 
         for (int i = 0; i < 8; ++i)
         {
@@ -1814,11 +2248,15 @@ public:
             g.drawRoundedRectangle (r, 6.0f, 1.3f);
 
             g.setColour (bright);
-            g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
+            g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
             g.drawText (proc.pads[i].name + (proc.pads[i].isVoiceTrained ? " [OK]" : ""), r.reduced (7.0f), juce::Justification::topLeft);
 
+            g.setColour (green);
+            g.setFont (juce::FontOptions (9.5f).withStyle ("Bold"));
+            g.drawText (juce::String ((int) (proc.pads[i].levelTrim * 100.0f)) + "%", r.reduced (7.0f), juce::Justification::topRight);
+
             g.setColour (proc.pads[i].hasCustomSample ? gold : muted);
-            g.setFont (juce::FontOptions (10.0f));
+            g.setFont (juce::FontOptions (9.5f));
             g.drawText (proc.pads[i].hasCustomSample ? proc.pads[i].customFileName : "[Empty Pad]", r.reduced (7.0f), juce::Justification::bottomLeft);
         }
 
@@ -1848,15 +2286,15 @@ public:
         g.setColour (green);
         g.fillRoundedRectangle (liveMeter.getX(), liveMeter.getY(), liveMeter.getWidth() * levelNorm, 14.0f, 6.0f);
 
-        trainVoiceBtnRect     = { 590.0f, 106.0f, 330.0f, 36.0f };
-        trainLoadButtonRect   = { 590.0f, 148.0f, 160.0f, 32.0f };
-        trainPlayButtonRect   = { 760.0f, 148.0f, 160.0f, 32.0f };
-        trainRevertButtonRect = { 590.0f, 186.0f, 330.0f, 28.0f };
+        trainVoiceBtnRect     = { 590.0f, 102.0f, 330.0f, 32.0f };
+        trainLoadButtonRect   = { 590.0f, 140.0f, 160.0f, 28.0f };
+        trainPlayButtonRect   = { 760.0f, 140.0f, 160.0f, 28.0f };
+        trainRevertButtonRect = { 590.0f, 174.0f, 330.0f, 24.0f };
 
         g.setColour (isListeningNow ? green : pink);
         g.fillRoundedRectangle (trainVoiceBtnRect, 6.0f);
         g.setColour (bright);
-        g.setFont (juce::FontOptions (12.0f).withStyle ("Bold"));
+        g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
         g.drawText (isListeningNow ? "LISTENING... MAKE SOUND 3 TIMES!" : "TRAIN VOICE (MAKE SOUND 3X)", trainVoiceBtnRect, juce::Justification::centred);
 
         g.setColour (gold);
@@ -1872,46 +2310,55 @@ public:
         g.setColour (juce::Colour (0xff292226));
         g.fillRoundedRectangle (trainRevertButtonRect, 6.0f);
         g.setColour (bright);
-        g.setFont (juce::FontOptions (11.0f));
+        g.setFont (juce::FontOptions (10.5f));
         g.drawText ("CLEAR PAD SAMPLE & TRAINING", trainRevertButtonRect, juce::Justification::centred);
 
         g.setColour (gold);
-        g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
-        g.drawText ("1. Train Mic Sensitivity: " + juce::String ((int) (proc.trainSensitivity * 100.0f)) + "%", 590, 222, 240, 16, juce::Justification::centredLeft);
-        trainSensSliderRect = { 590.0f, 240.0f, 330.0f, 12.0f };
+        g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+        g.drawText ("1. Train Mic Sensitivity: " + juce::String ((int) (proc.trainSensitivity * 100.0f)) + "%", 590, 206, 260, 15, juce::Justification::centredLeft);
+        trainSensSliderRect = { 590.0f, 222.0f, 330.0f, 11.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (trainSensSliderRect, 6.0f);
+        g.fillRoundedRectangle (trainSensSliderRect, 5.5f);
         g.setColour (pink);
         g.fillRoundedRectangle (trainSensSliderRect.getX(), trainSensSliderRect.getY(),
-                                trainSensSliderRect.getWidth() * proc.trainSensitivity, 12.0f, 6.0f);
+                                trainSensSliderRect.getWidth() * proc.trainSensitivity, 11.0f, 5.5f);
 
         g.setColour (gold);
-        g.drawText ("2. Hi-Hat / Soft Sound Boost: " + juce::String ((int) (proc.hiHatBoost * 100.0f)) + "%", 590, 260, 260, 16, juce::Justification::centredLeft);
-        hiHatBoostSliderRect = { 590.0f, 278.0f, 330.0f, 12.0f };
+        g.drawText ("2. Hi-Hat / Soft Boost: " + juce::String ((int) (proc.hiHatBoost * 100.0f)) + "%", 590, 240, 260, 15, juce::Justification::centredLeft);
+        hiHatBoostSliderRect = { 590.0f, 256.0f, 330.0f, 11.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (hiHatBoostSliderRect, 6.0f);
+        g.fillRoundedRectangle (hiHatBoostSliderRect, 5.5f);
         g.setColour (green);
         g.fillRoundedRectangle (hiHatBoostSliderRect.getX(), hiHatBoostSliderRect.getY(),
-                                hiHatBoostSliderRect.getWidth() * proc.hiHatBoost, 12.0f, 6.0f);
+                                hiHatBoostSliderRect.getWidth() * proc.hiHatBoost, 11.0f, 5.5f);
 
         g.setColour (gold);
-        g.drawText ("3. This Pad Sensitivity (" + currPad.name + "): " + juce::String ((int) (currPad.padSensitivity * 100.0f)) + "%", 590, 298, 290, 16, juce::Justification::centredLeft);
-        padSensSliderRect = { 590.0f, 316.0f, 330.0f, 12.0f };
+        g.drawText ("3. Pad Sensitivity (" + currPad.name + "): " + juce::String ((int) (currPad.padSensitivity * 100.0f)) + "%", 590, 274, 290, 15, juce::Justification::centredLeft);
+        padSensSliderRect = { 590.0f, 290.0f, 330.0f, 11.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (padSensSliderRect, 6.0f);
+        g.fillRoundedRectangle (padSensSliderRect, 5.5f);
         g.setColour (gold);
         g.fillRoundedRectangle (padSensSliderRect.getX(), padSensSliderRect.getY(),
-                                padSensSliderRect.getWidth() * currPad.padSensitivity, 12.0f, 6.0f);
+                                padSensSliderRect.getWidth() * currPad.padSensitivity, 11.0f, 5.5f);
+
+        g.setColour (green);
+        g.drawText ("4. Pad MIDI Velocity / Level (" + currPad.name + "): " + juce::String ((int) (currPad.levelTrim * 100.0f)) + "%", 590, 308, 310, 15, juce::Justification::centredLeft);
+        trainPadLevelSliderRect = { 590.0f, 324.0f, 330.0f, 11.0f };
+        g.setColour (juce::Colour (0xff151519));
+        g.fillRoundedRectangle (trainPadLevelSliderRect, 5.5f);
+        g.setColour (green);
+        g.fillRoundedRectangle (trainPadLevelSliderRect.getX(), trainPadLevelSliderRect.getY(),
+                                trainPadLevelSliderRect.getWidth() * currPad.levelTrim, 11.0f, 5.5f);
 
         g.setColour (pink);
-        g.drawText ("4. Retrig Lock (Anti-Double Hit): " + juce::String ((int) proc.triggerRetrigLockMs) + " ms", 590, 338, 300, 16, juce::Justification::centredLeft);
-        retrigLockSliderRect = { 590.0f, 356.0f, 330.0f, 12.0f };
+        g.drawText ("5. Retrig Lock (Anti-Double Hit): " + juce::String ((int) proc.triggerRetrigLockMs) + " ms", 590, 342, 300, 15, juce::Justification::centredLeft);
+        retrigLockSliderRect = { 590.0f, 358.0f, 330.0f, 11.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (retrigLockSliderRect, 6.0f);
+        g.fillRoundedRectangle (retrigLockSliderRect, 5.5f);
         float rtNorm = juce::jlimit (0.0f, 1.0f, (proc.triggerRetrigLockMs - 40.0f) / 160.0f);
         g.setColour (pink);
         g.fillRoundedRectangle (retrigLockSliderRect.getX(), retrigLockSliderRect.getY(),
-                                retrigLockSliderRect.getWidth() * rtNorm, 12.0f, 6.0f);
+                                retrigLockSliderRect.getWidth() * rtNorm, 11.0f, 5.5f);
     }
 
     void drawKeyTab (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
@@ -1924,12 +2371,12 @@ public:
         g.fillRoundedRectangle (keyTabAutoDetectRect, 6.0f);
         g.setColour (detecting ? bright : juce::Colours::black);
         g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
-        g.drawText (detecting ? "HUM MELODY NOW..." : ("AUTO KEY DETECT (" + proc.autoKeyStatusText + ")"),
+        g.drawText (detecting ? "HUM ROOT NOTE NOW..." : ("AUTO ROOT DETECT (" + proc.autoRootStatusText + ")"),
                     keyTabAutoDetectRect, juce::Justification::centred);
 
         g.setColour (gold);
         g.setFont (juce::FontOptions (13.0f).withStyle ("Bold"));
-        g.drawText ("SCALES & MAQAMAT:", 365, 84, 520, 22, juce::Justification::centredLeft);
+        g.drawText ("SCALES & MAQAMAT (MANUAL SELECTION):", 365, 84, 520, 22, juce::Justification::centredLeft);
 
         for (int m = 0; m < 10; ++m)
         {
@@ -2046,7 +2493,7 @@ public:
 
         g.setColour (bright);
         g.setFont (juce::FontOptions (12.0f).withStyle ("Bold"));
-        g.drawText ("MIDI Automation Out: Pitch Bend (-50c) | Mod Wheel (CC1) | Expression (CC11) | Glide (CC5/65)",
+        g.drawText ("MIDI Automation Out: Pitch Bend (-50c + Vibrato) | Mod (CC1) | Expression (CC11) | Glide (CC5/65)",
                     48, 236, 860, 22, juce::Justification::centredLeft);
 
         g.setColour (muted);
@@ -2055,17 +2502,20 @@ public:
                     48, 268, 880, 20, juce::Justification::centredLeft);
         g.drawText ("Studio One / Cubase / Reaper: Insert VoxNI on Mic Audio Track -> Set Instrument Track MIDI Input to VoxNI -> Record.",
                     48, 294, 880, 20, juce::Justification::centredLeft);
+        g.setColour (gold);
+        g.drawText ("VoxNI v" + juce::String (kPluginVersionString) + "  |  Manufactured by " + juce::String (kManufacturerName),
+                    48, 330, 880, 20, juce::Justification::centredLeft);
     }
 
-    void drawBottomSection (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright)
+    void drawBottomSection (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
     {
         bool detecting = proc.isDetectingKey.load();
-        autoKeyBottomRect = { 114.0f, 414.0f, 94.0f, 25.0f };
+        autoRootBottomRect = { 114.0f, 414.0f, 94.0f, 25.0f };
         g.setColour (detecting ? pink : green);
-        g.fillRoundedRectangle (autoKeyBottomRect, 5.0f);
+        g.fillRoundedRectangle (autoRootBottomRect, 5.0f);
         g.setColour (detecting ? bright : juce::Colours::black);
         g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
-        g.drawText (detecting ? "LISTENING..." : "AUTO KEY", autoKeyBottomRect, juce::Justification::centred);
+        g.drawText (detecting ? "LISTENING..." : "AUTO ROOT", autoRootBottomRect, juce::Justification::centred);
 
         rootCycleRect = { 214.0f, 414.0f, 62.0f, 25.0f };
         g.setColour (juce::Colour (0xff26262e));
@@ -2103,15 +2553,52 @@ public:
         g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
         g.drawText ("HOST: " + juce::String (proc.hostBpm.load(), 1) + " BPM", 768, 414, 175, 25, juce::Justification::centredLeft);
 
+        // Left Expression Wheels + Dedicated VIB & CC Switches + Mini Intensity Buttons
+        pitchWheelRect = { 34.0f, 446.0f, 28.0f, 88.0f };
+        levelWheelRect = { 70.0f, 446.0f, 28.0f, 88.0f };
         g.setColour (juce::Colour (0xff151519));
-        g.fillRoundedRectangle (38.0f, 446.0f, 24.0f, 102.0f, 5.0f);
-        g.fillRoundedRectangle (70.0f, 446.0f, 24.0f, 102.0f, 5.0f);
-        float pbNorm = (float) proc.currentPitchBendValue.load() / 16383.0f;
-        g.setColour (pink);
-        g.fillRoundedRectangle (40.0f, 446.0f + (1.0f - pbNorm) * 86.0f, 20.0f, 14.0f, 3.0f);
-        g.setColour (gold);
-        g.fillRoundedRectangle (72.0f, 446.0f + (1.0f - proc.vowelEnv) * 86.0f, 20.0f, 14.0f, 3.0f);
+        g.fillRoundedRectangle (pitchWheelRect, 5.0f);
+        g.fillRoundedRectangle (levelWheelRect, 5.0f);
 
+        float pbNorm = (float) proc.currentPitchBendValue.load() / 16383.0f;
+        g.setColour (proc.vibratoEnabled.load() ? pink : pink.withAlpha (0.45f));
+        g.fillRoundedRectangle (pitchWheelRect.getX() + 3.0f, pitchWheelRect.getY() + (1.0f - pbNorm) * 72.0f, 22.0f, 14.0f, 3.0f);
+
+        g.setColour (proc.sendAutomationCC.load() ? gold : gold.withAlpha (0.35f));
+        g.fillRoundedRectangle (levelWheelRect.getX() + 3.0f, levelWheelRect.getY() + (1.0f - proc.vowelEnv) * 72.0f, 22.0f, 14.0f, 3.0f);
+
+        // VIB Switch + Depth (S/M/D)
+        vibSwitchRect = { 32.0f, 540.0f, 32.0f, 20.0f };
+        vibDepthRect  = { 32.0f, 564.0f, 32.0f, 20.0f };
+        bool vibOn = proc.vibratoEnabled.load();
+        g.setColour (vibOn ? pink : juce::Colour (0xff282830));
+        g.fillRoundedRectangle (vibSwitchRect, 4.0f);
+        g.setColour (bright);
+        g.setFont (juce::FontOptions (9.0f).withStyle ("Bold"));
+        g.drawText ("VIB", vibSwitchRect, juce::Justification::centred);
+
+        const char* vibLvl[3] = { "S", "M", "D" };
+        g.setColour (juce::Colour (0xff222229));
+        g.fillRoundedRectangle (vibDepthRect, 4.0f);
+        g.setColour (vibOn ? gold : muted);
+        g.drawText (vibLvl[proc.vibratoDepthMode.load() % 3], vibDepthRect, juce::Justification::centred);
+
+        // CC Switch + Sensitivity (S/M/H)
+        ccSwitchRect = { 68.0f, 540.0f, 32.0f, 20.0f };
+        ccSensRect   = { 68.0f, 564.0f, 32.0f, 20.0f };
+        bool ccOn = proc.sendAutomationCC.load();
+        g.setColour (ccOn ? green : juce::Colour (0xff282830));
+        g.fillRoundedRectangle (ccSwitchRect, 4.0f);
+        g.setColour (ccOn ? juce::Colours::black : bright);
+        g.drawText ("CC", ccSwitchRect, juce::Justification::centred);
+
+        const char* ccLvl[3] = { "S", "M", "H" };
+        g.setColour (juce::Colour (0xff222229));
+        g.fillRoundedRectangle (ccSensRect, 4.0f);
+        g.setColour (ccOn ? green : muted);
+        g.drawText (ccLvl[proc.ccSensitivityMode.load() % 3], ccSensRect, juce::Justification::centred);
+
+        // 36-Key Visual Keyboard
         const float kbX = 114.0f, kbY = 446.0f, kbW = 830.0f, kbH = 102.0f;
         const int numKeys = 36;
         const float keyW = kbW / (float) numKeys;
@@ -2126,40 +2613,282 @@ public:
             g.fillRoundedRectangle (kr, 3.0f);
         }
 
+        // Bottom Controls Row
         synthCycleRect = { 114.0f, 560.0f, 210.0f, 28.0f };
         g.setColour (juce::Colour (0xff25252c));
         g.fillRoundedRectangle (synthCycleRect, 5.0f);
         g.setColour (gold);
+        g.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
         const char* synthNames[4] = { "Synth: Electric Saz", "Synth: G-Clarinet", "Synth: Electric Oud", "Synth: Sub Bass" };
         g.drawText (synthNames[proc.synthPresetIndex % 4], synthCycleRect, juce::Justification::centred);
 
-        intellMuteRect = { 338.0f, 560.0f, 155.0f, 28.0f };
+        intellMuteRect = { 338.0f, 560.0f, 165.0f, 28.0f };
         bool intMuted = proc.intellAudioMuted.load();
         g.setColour (intMuted ? pink : juce::Colour (0xff2b3a30));
         g.fillRoundedRectangle (intellMuteRect, 5.0f);
         g.setColour (bright);
         g.drawText (intMuted ? "Intell Audio: MUTED" : "Intell Audio: ON", intellMuteRect, juce::Justification::centred);
 
-        trigMuteRect = { 505.0f, 560.0f, 155.0f, 28.0f };
+        trigMuteRect = { 515.0f, 560.0f, 165.0f, 28.0f };
         bool trMuted = proc.trigAudioMuted.load();
         g.setColour (trMuted ? pink : juce::Colour (0xff2b3a30));
         g.fillRoundedRectangle (trigMuteRect, 5.0f);
         g.setColour (bright);
         g.drawText (trMuted ? "Trig Audio: MUTED" : "Trig Audio: ON", trigMuteRect, juce::Justification::centred);
 
-        autoCCRect = { 672.0f, 560.0f, 272.0f, 28.0f };
-        bool ccOn = proc.sendAutomationCC.load();
-        g.setColour (ccOn ? juce::Colour (0xff2b3a30) : juce::Colour (0xff2a2a32));
-        g.fillRoundedRectangle (autoCCRect, 5.0f);
-        g.setColour (ccOn ? green : pink);
-        g.drawRoundedRectangle (autoCCRect, 5.0f, 1.0f);
+        brandFooterRect = { 692.0f, 560.0f, 252.0f, 28.0f };
+        g.setColour (juce::Colour (0xff1f1f26));
+        g.fillRoundedRectangle (brandFooterRect, 5.0f);
+        g.setColour (gold.withAlpha (0.4f));
+        g.drawRoundedRectangle (brandFooterRect, 5.0f, 1.0f);
+        g.setColour (gold);
+        g.setFont (juce::FontOptions (10.5f).withStyle ("Bold"));
+        g.drawText ("VoxNI v" + juce::String (kPluginVersionString) + "  |  " + juce::String (kManufacturerName),
+                    brandFooterRect, juce::Justification::centred);
+    }
+
+    void drawArabicTooltip (juce::Graphics& g, juce::Colour gold, juce::Colour bright)
+    {
+        juce::Font tipFont (juce::FontOptions (12.5f).withName ("Tahoma"));
+        g.setFont (tipFont);
+
+        const float boxW = 300.0f;
+        const float boxH = 44.0f;
+        float bx = juce::jlimit (12.0f, (float) getWidth() - boxW - 12.0f, tooltipMousePos.x - boxW * 0.5f);
+        float by = tooltipMousePos.y - boxH - 14.0f;
+        if (by < 44.0f) by = tooltipMousePos.y + 18.0f;
+
+        juce::Rectangle<float> tipRect (bx, by, boxW, boxH);
+        g.setColour (juce::Colour (0xf0131318));
+        g.fillRoundedRectangle (tipRect, 7.0f);
+        g.setColour (gold.withAlpha (0.85f));
+        g.drawRoundedRectangle (tipRect, 7.0f, 1.2f);
+
         g.setColour (bright);
-        g.drawText (ccOn ? "AUTO CC (MOD1 / EXPR11): ON" : "AUTO CC (MOD1 / EXPR11): OFF", autoCCRect, juce::Justification::centred);
+        g.drawFittedText (currentTooltipText, tipRect.reduced (10.0f, 4.0f).toNearestInt(), juce::Justification::centred, 2);
+    }
+
+    void drawAboutPopupModal (juce::Graphics& g, juce::Colour gold, juce::Colour pink, juce::Colour green, juce::Colour bright, juce::Colour muted)
+    {
+        g.setColour (juce::Colours::black.withAlpha (0.76f));
+        g.fillRect (getLocalBounds());
+
+        aboutCardRect = { 230.0f, 120.0f, 500.0f, 355.0f };
+        g.setColour (juce::Colour (0xff1a1a20));
+        g.fillRoundedRectangle (aboutCardRect, 12.0f);
+        g.setColour (gold);
+        g.drawRoundedRectangle (aboutCardRect, 12.0f, 1.8f);
+
+        aboutCloseBtnRect = { aboutCardRect.getRight() - 36.0f, aboutCardRect.getY() + 10.0f, 26.0f, 26.0f };
+        g.setColour (juce::Colour (0xff2b2b34));
+        g.fillRoundedRectangle (aboutCloseBtnRect, 5.0f);
+        g.setColour (bright);
+        g.setFont (juce::FontOptions (12.0f).withStyle ("Bold"));
+        g.drawText ("X", aboutCloseBtnRect, juce::Justification::centred);
+
+        if (logoImage.isValid())
+            g.drawImageWithin (logoImage, (int) aboutCardRect.getX() + 140, (int) aboutCardRect.getY() + 26, 220, 74, juce::RectanglePlacement::centred);
+
+        g.setColour (gold);
+        g.setFont (juce::FontOptions (18.0f).withStyle ("Bold"));
+        g.drawText ("VoxNI  v" + juce::String (kPluginVersionString),
+                    (int) aboutCardRect.getX() + 20, (int) aboutCardRect.getY() + 108, 460, 26, juce::Justification::centred);
+
+        g.setColour (bright);
+        g.setFont (juce::FontOptions (12.5f));
+        g.drawFittedText ("Real-Time Vocal-to-MIDI, Oriental Maqam Quarter-Tone, Smart Chords & Beatbox Engine.",
+                          (int) aboutCardRect.getX() + 36, (int) aboutCardRect.getY() + 142, 428, 38, juce::Justification::centred, 2);
+
+        g.setColour (gold.withAlpha (0.25f));
+        g.drawHorizontalLine ((int) aboutCardRect.getY() + 194, aboutCardRect.getX() + 36.0f, aboutCardRect.getRight() - 36.0f);
+
+        g.setColour (muted);
+        g.setFont (juce::FontOptions (11.5f).withStyle ("Bold"));
+        g.drawText ("MANUFACTURED BY", (int) aboutCardRect.getX() + 20, (int) aboutCardRect.getY() + 206, 460, 18, juce::Justification::centred);
+
+        g.setColour (bright);
+        g.setFont (juce::FontOptions (17.0f).withStyle ("Bold"));
+        g.drawText (kManufacturerName, (int) aboutCardRect.getX() + 20, (int) aboutCardRect.getY() + 226, 460, 26, juce::Justification::centred);
+
+        g.setColour (muted);
+        g.setFont (juce::FontOptions (11.0f));
+        g.drawText ("Copyright (c) 2026 " + juce::String (kManufacturerName) + ". All Rights Reserved.",
+                    (int) aboutCardRect.getX() + 20, (int) aboutCardRect.getY() + 258, 460, 20, juce::Justification::centred);
+
+        aboutLinkBtnRect = { aboutCardRect.getX() + 95.0f, aboutCardRect.getY() + 294.0f, 310.0f, 38.0f };
+        bool hasLink = juce::String (kManufacturerUrl).isNotEmpty();
+        g.setColour (hasLink ? green : juce::Colour (0xff2b2b34));
+        g.fillRoundedRectangle (aboutLinkBtnRect, 7.0f);
+        g.setColour (hasLink ? juce::Colours::black : gold);
+        g.setFont (juce::FontOptions (12.0f).withStyle ("Bold"));
+        g.drawText (hasLink ? "CONTACT & PURCHASE - MIDO MAZZIKA" : "OFFICIAL LINK COMING SOON - MIDO MAZZIKA",
+                    aboutLinkBtnRect, juce::Justification::centred);
+    }
+
+    void updateArabicTooltip (juce::Point<float> pt)
+    {
+        tooltipMousePos = pt;
+        juce::String tip;
+
+        if (logoClickRect.contains (pt) || brandFooterRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"VoxNI v1.0.0 من تطوير Mido Mazzika — اضغط هنا لمعلومات الإصدار والمصنّع");
+        else if (exclusiveModeRects[0].contains (pt))
+            tip = juce::String::fromUTF8 (u8"مود اللحن فقط: يحوّل غناءك ودندنتك إلى نوتات MIDI بالربع تون والفيبراتو");
+        else if (exclusiveModeRects[1].contains (pt))
+            tip = juce::String::fromUTF8 (u8"مود الإيقاع فقط: يحوّل البيت بوكس لضربات درامز وتريجر على الـ 8 بادات");
+        else if (exclusiveModeRects[2].contains (pt))
+            tip = juce::String::fromUTF8 (u8"مود الكوردات فقط: يعزف كوردات شرقية وغربية ذكية تلقائياً مع صوتك");
+        else if (presetNameRect.contains (pt) || presetPrevRect.contains (pt) || presetNextRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"قائمة البريسيتس: اختار من 4 إعدادات جاهزة أو بريسيتس محفوظة على جهازك");
+        else if (presetSaveRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"حفظ الإعدادات الحالية كبريسيت جديد على جهازك لاستدعائه في أي مشروع");
+        else if (midiRecButtonRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"تسجيل الميدي داخلياً مع النوتات والأوتوميشن لسحبه مباشرة للـ DAW");
+        else if (quantizeCycleRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"تظبيط إيقاع النوتات المسجلة (Quantize) على 1/8 أو 1/16 أو إيقافه");
+        else if (midiDragButtonRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"اسحب الزرار ده وارميه جوه الـ Piano Roll لنقل العزف المسجل فوراً");
+        else if (globalGateMeterRect.expanded (6.0f, 0.0f).contains (pt))
+            tip = juce::String::fromUTF8 (u8"بوابة عزل الضوضاء (Noise Gate): اسحب الخط الوردي لفوق لمنع شوشرة الغرفة");
+        else if (vibSwitchRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"تفعيل/إيقاف مرور الفيبراتو والعُرَب البشرية على عجلة الـ Pitch Bend");
+        else if (vibDepthRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"شدة الفيبراتو: S ناعم | M متوسط | D عميق (ممتاز للناي والكمانجة)");
+        else if (ccSwitchRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"تفعيل/إيقاف إرسال أوتوميشن النفس وليفل الصوت (Mod CC1 و Expr CC11)");
+        else if (ccSensRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"حساسية استجابة الإكسبريشن والنفس: S هادي | M متوسط | H عالي");
+        else if (autoRootBottomRect.contains (pt) || (currentTab == 2 && keyTabAutoDetectRect.contains (pt)))
+            tip = juce::String::fromUTF8 (u8"Auto Root: دندن نغمة الركوز وسيتعرف البلجن على مفتاح الأغنية تلقائياً");
+        else if (rootCycleRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"تغيير درجة الركوز (Key) للمقام أو السلم الحالي");
+        else if (maqamCycleRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"التبديل اليدوي بين المقامات الشرقية والسلالم الغربية");
+        else if (rangePresetRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"تحديد طبقة الأوكتاف (Bass / Tenor / Alto...) لمنع القفزات المفاجئة");
+        else if (semiMinusRect.contains (pt) || semiPlusRect.contains (pt) || semiDisplayRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"رفع أو خفض النغمة بالـ Semitone (اضغط في النص للتصفير)");
+        else if (intellMuteRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"كتم أو تشغيل الصوت الداخلي للميلودي والكوردات لسماع الآلة الخارجية فقط");
+        else if (trigMuteRect.contains (pt))
+            tip = juce::String::fromUTF8 (u8"كتم أو تشغيل صوت عينات البادات الداخلي مع استمرار إرسال الـ MIDI");
+        else if (currentTab == 0)
+        {
+            if (pitchAnalyzerRect.contains (pt))
+                tip = juce::String::fromUTF8 (u8"أنالايزر حي لحركة صوتك والفيبراتو والربع تون لحظياً بستايل Auto-Tune");
+            else if (stickinessSliderRect.expanded (0.0f, 4.0f).contains (pt))
+                tip = juce::String::fromUTF8 (u8"ثبات النوتة (Stickiness): يمنع اهتزاز الحرف وتبديله بالغلط مع الفيبراتو");
+            else if (voiceModeRects[0].contains (pt))
+                tip = juce::String::fromUTF8 (u8"MONO: يقطع الحرف القديم قبل الجديد لـ Piano Roll نضيف بدون تداخل");
+            else if (voiceModeRects[1].contains (pt))
+                tip = juce::String::fromUTF8 (u8"LEGATO: تداخل ناعم بين النوتات لتشغيل الجلايد في آلات السنث والناي");
+            else if (voiceModeRects[2].contains (pt))
+                tip = juce::String::fromUTF8 (u8"POLY: يترك النوتات ترن وتندمج مع بعضها مثل دواسة Sustain خفيفة");
+            else if (glideSliderRect.expanded (0.0f, 4.0f).contains (pt))
+                tip = juce::String::fromUTF8 (u8"سرعة الجلايد (Portamento CC5/65): يزحلق النغمة بنعومة للسنث الخارجي");
+            else if (melodyLockSliderRect.expanded (0.0f, 4.0f).contains (pt))
+                tip = juce::String::fromUTF8 (u8"Note Lock: يمنع التريم والرول السريع بين الحروف عند الانتقال من نوتة لأخرى");
+            else if (velocityCurveBoxRect.contains (pt))
+                tip = juce::String::fromUTF8 (u8"منحنى الدايناميك: اسحب لفوق أو لتحت لضبط قوة ضربات الميدي مع شدة صوتك");
+            else if (fixedVelToggleRect.contains (pt))
+                tip = juce::String::fromUTF8 (u8"تثبيت قوة كل النوتات على أقصى شدة (127) أو تركها دايناميك مع صوتك");
+            else if (playCalibBtnRect.contains (pt))
+                tip = juce::String::fromUTF8 (u8"معايرة ضوضاء الغرفة في ثانية واحدة لضبط بوابة المايك أوتوماتيكياً");
+            else
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    if (padLevelRects[i].contains (pt))
+                    {
+                        tip = juce::String::fromUTF8 (u8"مستوى وقوة الباد (LVL %): اسحب لضبط قوة الـ Velocity المرسلة للآلة التانية");
+                        break;
+                    }
+                    if (padBounds[i].contains (pt))
+                    {
+                        tip = juce::String::fromUTF8 (u8"باد إيقاع: اضغط للتجربة أو اسحب ملف WAV/MP3 وأفلته هنا مباشرة");
+                        break;
+                    }
+                }
+            }
+        }
+        else if (currentTab == 1)
+        {
+            if (trainPadLevelSliderRect.expanded (0.0f, 4.0f).contains (pt))
+                tip = juce::String::fromUTF8 (u8"التحكم في قوة الـ Velocity ومستوى صوت الباد المحدد بشكل مستقل");
+            else if (retrigLockSliderRect.expanded (0.0f, 4.0f).contains (pt))
+                tip = juce::String::fromUTF8 (u8"Retrig Lock: يمنع تكرار الضربة الواحدة مرتين بالغلط (Anti-Double Hit)");
+        }
+        else if (currentTab == 3 && chordLockSliderRect.expanded (0.0f, 4.0f).contains (pt))
+        {
+            tip = juce::String::fromUTF8 (u8"Chord Lock: يثبّت الكورد ويمنع تقلب الكوردات في النص أثناء الانتقال بصوتك");
+        }
+
+        if (tip != currentTooltipText)
+        {
+            currentTooltipText = tip;
+            repaint();
+        }
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        if (! showAboutPopup)
+            updateArabicTooltip (e.position);
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        if (currentTooltipText.isNotEmpty())
+        {
+            currentTooltipText.clear();
+            repaint();
+        }
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
         juce::Point<float> pt = e.position;
+
+        if (showAboutPopup)
+        {
+            if (aboutCloseBtnRect.contains (pt) || ! aboutCardRect.contains (pt))
+            {
+                showAboutPopup = false;
+                repaint();
+                return;
+            }
+            if (aboutLinkBtnRect.contains (pt))
+            {
+                juce::String urlStr (kManufacturerUrl);
+                if (urlStr.isNotEmpty())
+                    juce::URL (urlStr).launchInDefaultBrowser();
+                return;
+            }
+            return;
+        }
+
+        if (logoClickRect.contains (pt) || brandFooterRect.contains (pt))
+        {
+            currentTooltipText.clear();
+            showAboutPopup = true;
+            repaint();
+            return;
+        }
+
+        if (presetPrevRect.contains (pt))
+        {
+            int nextIdx = (proc.currentPresetIndex <= 0) ? ((int) kFactoryPresetNames.size() - 1) : (proc.currentPresetIndex - 1);
+            proc.applyFactoryPreset (nextIdx);
+            repaint(); return;
+        }
+        if (presetNextRect.contains (pt))
+        {
+            int nextIdx = (proc.currentPresetIndex + 1) % (int) kFactoryPresetNames.size();
+            proc.applyFactoryPreset (nextIdx);
+            repaint(); return;
+        }
+        if (presetNameRect.contains (pt)) { showPresetsMenu(); return; }
+        if (presetSaveRect.contains (pt)) { openSavePresetDialog(); return; }
 
         if (globalGateMeterRect.expanded (6.0f, 0.0f).contains (pt))
         {
@@ -2191,10 +2920,10 @@ public:
             }
         }
 
-        if (autoKeyBottomRect.contains (pt) || (currentTab == 2 && keyTabAutoDetectRect.contains (pt)))
+        if (autoRootBottomRect.contains (pt) || (currentTab == 2 && keyTabAutoDetectRect.contains (pt)))
         {
             proc.setExclusiveEngineMode (ModeMelodyOnly);
-            proc.toggleAutoKeyDetection();
+            proc.toggleAutoRootDetection();
             repaint(); return;
         }
 
@@ -2205,9 +2934,13 @@ public:
         if (semiPlusRect.contains (pt))     { proc.semitoneTranspose = juce::jlimit (-24, 24, proc.semitoneTranspose + 1); repaint(); return; }
         if (semiDisplayRect.contains (pt))  { proc.semitoneTranspose = 0; repaint(); return; }
 
+        if (vibSwitchRect.contains (pt))    { proc.vibratoEnabled.store (! proc.vibratoEnabled.load()); repaint(); return; }
+        if (vibDepthRect.contains (pt))     { proc.vibratoDepthMode.store ((proc.vibratoDepthMode.load() + 1) % 3); repaint(); return; }
+        if (ccSwitchRect.contains (pt))     { proc.sendAutomationCC.store (! proc.sendAutomationCC.load()); repaint(); return; }
+        if (ccSensRect.contains (pt))       { proc.ccSensitivityMode.store ((proc.ccSensitivityMode.load() + 1) % 3); repaint(); return; }
+
         if (intellMuteRect.contains (pt))   { proc.intellAudioMuted.store (! proc.intellAudioMuted.load()); repaint(); return; }
         if (trigMuteRect.contains (pt))     { proc.trigAudioMuted.store (! proc.trigAudioMuted.load()); repaint(); return; }
-        if (autoCCRect.contains (pt))       { proc.sendAutomationCC.store (! proc.sendAutomationCC.load()); repaint(); return; }
         if (synthCycleRect.contains (pt))   { proc.synthPresetIndex = (proc.synthPresetIndex + 1) % 4; repaint(); return; }
 
         for (int k = 0; k < 36; ++k)
@@ -2260,6 +2993,13 @@ public:
             for (int i = 0; i < 8; ++i)
             {
                 if (padLoadRects[i].contains (pt)) { openSampleChooserForPad (i); return; }
+                if (padLevelRects[i].expanded (0.0f, 3.0f).contains (pt))
+                {
+                    draggingPadLevelIndex = i;
+                    float norm = juce::jlimit (0.15f, 1.0f, (pt.x - padLevelRects[i].getX()) / padLevelRects[i].getWidth());
+                    proc.pads[i].levelTrim = norm;
+                    repaint(); return;
+                }
                 if (padBounds[i].contains (pt))    { proc.setExclusiveEngineMode (ModeTriggersOnly); proc.triggerPadNow (i); repaint(); return; }
             }
             if (stickinessSliderRect.expanded (0.0f, 5.0f).contains (pt))
@@ -2269,7 +3009,7 @@ public:
             }
             for (int i = 0; i < 12; ++i)
             {
-                if (wheelSegmentCenters[i].getDistanceFrom (pt) < 24.0f)
+                if (wheelSegmentCenters[i].getDistanceFrom (pt) < 22.0f)
                 {
                     proc.setExclusiveEngineMode (ModeMelodyOnly);
                     if (e.mods.isRightButtonDown() || e.mods.isShiftDown()) { proc.noteStates[i] = (proc.noteStates[i] + 1) % 3; proc.rebuildSmartDegreeChords(); }
@@ -2305,6 +3045,11 @@ public:
             if (padSensSliderRect.expanded (0.0f, 4.0f).contains (pt))
             {
                 proc.pads[selectedTrainPad].padSensitivity = juce::jlimit (0.1f, 1.0f, (pt.x - padSensSliderRect.getX()) / padSensSliderRect.getWidth());
+                repaint(); return;
+            }
+            if (trainPadLevelSliderRect.expanded (0.0f, 4.0f).contains (pt))
+            {
+                proc.pads[selectedTrainPad].levelTrim = juce::jlimit (0.15f, 1.0f, (pt.x - trainPadLevelSliderRect.getX()) / trainPadLevelSliderRect.getWidth());
                 repaint(); return;
             }
             if (retrigLockSliderRect.expanded (0.0f, 4.0f).contains (pt))
@@ -2368,7 +3113,15 @@ public:
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
+        if (showAboutPopup) return;
         juce::Point<float> pt = e.position;
+
+        if (draggingPadLevelIndex >= 0 && draggingPadLevelIndex < 8)
+        {
+            auto& r = padLevelRects[draggingPadLevelIndex];
+            proc.pads[draggingPadLevelIndex].levelTrim = juce::jlimit (0.15f, 1.0f, (pt.x - r.getX()) / r.getWidth());
+            repaint(); return;
+        }
 
         if (globalGateMeterRect.expanded (6.0f, 0.0f).contains (e.mouseDownPosition))
         {
@@ -2425,6 +3178,11 @@ public:
                 proc.pads[selectedTrainPad].padSensitivity = juce::jlimit (0.1f, 1.0f, (pt.x - padSensSliderRect.getX()) / padSensSliderRect.getWidth());
                 repaint(); return;
             }
+            if (trainPadLevelSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
+            {
+                proc.pads[selectedTrainPad].levelTrim = juce::jlimit (0.15f, 1.0f, (pt.x - trainPadLevelSliderRect.getX()) / trainPadLevelSliderRect.getWidth());
+                repaint(); return;
+            }
             if (retrigLockSliderRect.expanded (0.0f, 4.0f).contains (e.mouseDownPosition))
             {
                 float norm = juce::jlimit (0.0f, 1.0f, (pt.x - retrigLockSliderRect.getX()) / retrigLockSliderRect.getWidth());
@@ -2462,6 +3220,7 @@ public:
     void mouseUp (const juce::MouseEvent&) override
     {
         isDraggingMidi = false;
+        draggingPadLevelIndex = -1;
         proc.guiManualMidiNote.store (-1);
     }
 
@@ -2470,28 +3229,38 @@ private:
     juce::Image logoImage;
     int currentTab = 0;
     int selectedTrainPad = 0;
+    int draggingPadLevelIndex = -1;
     bool isDraggingMidi = false;
+    bool showAboutPopup = false;
+
+    juce::String currentTooltipText;
+    juce::Point<float> tooltipMousePos { 480.0f, 300.0f };
 
     std::array<juce::Rectangle<float>, 3> exclusiveModeRects;
     std::array<juce::Rectangle<float>, 3> voiceModeRects;
     std::array<juce::Rectangle<float>, 5> tabRects;
     std::array<juce::Rectangle<float>, 8> padBounds;
     std::array<juce::Rectangle<float>, 8> padLoadRects;
+    std::array<juce::Rectangle<float>, 8> padLevelRects;
     std::array<juce::Point<float>, 12> wheelSegmentCenters;
     std::array<juce::Rectangle<float>, 10> maqamPresetRects;
     std::array<std::array<juce::Rectangle<float>, 6>, 7> chordOptionRects;
     std::array<juce::Rectangle<float>, 36> pianoKeyRects;
 
-    juce::Rectangle<float> globalGateMeterRect;
+    juce::Rectangle<float> logoClickRect, brandFooterRect;
+    juce::Rectangle<float> presetPrevRect, presetNameRect, presetNextRect, presetSaveRect;
+    juce::Rectangle<float> aboutCardRect, aboutCloseBtnRect, aboutLinkBtnRect;
+    juce::Rectangle<float> globalGateMeterRect, pitchAnalyzerRect;
     juce::Rectangle<float> midiRecButtonRect, quantizeCycleRect, midiDragButtonRect, midiClearButtonRect;
     juce::Rectangle<float> playTrigSensRect, stickinessSliderRect, glideSliderRect, melodyLockSliderRect, velocityCurveBoxRect, fixedVelToggleRect, playCalibBtnRect;
     juce::Rectangle<float> keyTabAutoDetectRect, qtDepthSliderRect;
     juce::Rectangle<float> trainVoiceBtnRect, trainLoadButtonRect, trainPlayButtonRect, trainRevertButtonRect;
-    juce::Rectangle<float> trainSensSliderRect, hiHatBoostSliderRect, padSensSliderRect, retrigLockSliderRect;
+    juce::Rectangle<float> trainSensSliderRect, hiHatBoostSliderRect, padSensSliderRect, trainPadLevelSliderRect, retrigLockSliderRect;
     juce::Rectangle<float> chordLockSliderRect;
     juce::Rectangle<float> condenserToggleRect, calibrateRoomBtnRect, assignGateSliderRect;
-    juce::Rectangle<float> autoKeyBottomRect, rootCycleRect, maqamCycleRect, rangePresetRect, semiMinusRect, semiDisplayRect, semiPlusRect;
-    juce::Rectangle<float> synthCycleRect, intellMuteRect, trigMuteRect, autoCCRect;
+    juce::Rectangle<float> autoRootBottomRect, rootCycleRect, maqamCycleRect, rangePresetRect, semiMinusRect, semiDisplayRect, semiPlusRect;
+    juce::Rectangle<float> pitchWheelRect, levelWheelRect, vibSwitchRect, vibDepthRect, ccSwitchRect, ccSensRect;
+    juce::Rectangle<float> synthCycleRect, intellMuteRect, trigMuteRect;
 
     std::unique_ptr<juce::FileChooser> fileChooser;
 
